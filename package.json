@@ -1,0 +1,19 @@
+{
+  "name": "wps365-drive-gateway",
+  "version": "0.1.0",
+  "description": "S3-compatible gateway for WPS 365 cloud drive (个人盘 + 团队文档库)",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "aws4": "^1.13.0",
+    "express": "^4.19.0"
+  },
+  "license": "MIT"
+}
