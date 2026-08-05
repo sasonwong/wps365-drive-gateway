@@ -227,7 +227,18 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
       const parts = req.params[0].split("/").filter(Boolean);
       const file = await resolvePath(wps, b.driveId, parts);
       if (!file) return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified key does not exist."));
-      await wps.deleteFile(b.driveId, file.id);
+      if (file.type === "folder") {
+        // delete_file 不支持文件夹，文件夹必须走 batch_delete（异步）
+        const t = await wps.post(`/v7/drives/${b.driveId}/files/batch_delete`, { file_ids: [file.id] });
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const m = await wps.taskMeta(t.task_id);
+          if (m.status === "success") break;
+          if (m.failed > 0) throw new Error(`delete folder task failed: ${t.task_id}`);
+        }
+      } else {
+        await wps.deleteFile(b.driveId, file.id);
+      }
       // 失效文件所在目录缓存（父目录 = 去掉最后一层的 parts）
       const parentParts = parts.slice(0, -1);
       const parent = parentParts.length ? await resolveNode(wps, b.driveId, parentParts) : { id: "0" };
