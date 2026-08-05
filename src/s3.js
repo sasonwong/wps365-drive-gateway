@@ -217,11 +217,15 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
         }
       }
       if (!quiet) for (const c of batch) deleted.push(`  <Deleted><Key>${xmlEscape(c.key)}</Key></Deleted>`);
-      // 失效涉及目录缓存
+      // 失效涉及目录缓存 + 清理变空目录
+      const pruned = new Set();
       for (const c of batch) {
         const parentParts = c.key.split("/").filter(Boolean).slice(0, -1);
-        const parent = parentParts.length ? await resolveNode(wps, b.driveId, parentParts) : { id: "0" };
-        invalidateDir(b.driveId, parent.id);
+        const pk = parentParts.join("/");
+        if (!pruned.has(pk)) {
+          pruned.add(pk);
+          await pruneEmptyDirs(wps, b.driveId, parentParts);
+        }
       }
       res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\n${deleted.join("\n")}${errors.join("\n")}\n</DeleteResult>`);
@@ -307,10 +311,9 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
       } else {
         await wps.deleteFile(b.driveId, file.id);
       }
-      // 失效文件所在目录缓存（父目录 = 去掉最后一层的 parts）
+      // 失效文件所在目录缓存 + 清理变空目录
       const parentParts = parts.slice(0, -1);
-      const parent = parentParts.length ? await resolveNode(wps, b.driveId, parentParts) : { id: "0" };
-      invalidateDir(b.driveId, parent.id);
+      await pruneEmptyDirs(wps, b.driveId, parentParts);
       res.status(204).end();
     } catch (e) { next(e); }
   });
@@ -348,6 +351,23 @@ async function childrenMap(wps, driveId, parentId) {
 // 写入操作后失效父目录缓存（PUT/DELETE/Copy/Complete 都会改变目录内容）
 function invalidateDir(driveId, parentId) {
   dirCache.delete(`${driveId}/${parentId}`);
+}
+
+// 删除对象后清理变空的父目录（WPS 目录是真实实体，S3 语义下 purge/rm 会留空目录）
+// 从最深层父目录向上递归；有内容即停。下次 PUT 会自动重建目录。
+async function pruneEmptyDirs(wps, driveId, parentParts) {
+  for (let i = parentParts.length; i > 0; i--) {
+    const parts = parentParts.slice(0, i);
+    const dir = await resolveNode(wps, driveId, parts);
+    if (!dir) continue;
+    invalidateDir(driveId, dir.id);
+    const c = await wps.children(driveId, dir.id);
+    if ((c.items ?? []).length > 0) return;
+    await wps.post(`/v7/drives/${driveId}/files/batch_delete`, { file_ids: [dir.id] });
+    const gp = parts.slice(0, -1);
+    const gpNode = gp.length ? await resolveNode(wps, driveId, gp) : { id: "0" };
+    invalidateDir(driveId, gpNode.id);
+  }
 }
 
 async function resolveNode(wps, driveId, parts) {
