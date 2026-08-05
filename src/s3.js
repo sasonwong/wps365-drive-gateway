@@ -90,7 +90,8 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
   });
 
   // ── GetObject / HeadObject: GET|HEAD /{bucket}/{key} ──────────
-  const handleGet = async (req, res) => {
+  const handleGet = async (req, res, next) => {
+    try {
     const b = bucket(req.params.bucket);
     if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
     const file = await resolvePath(wps, b.driveId, req.params[0].split("/").filter(Boolean));
@@ -119,6 +120,7 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
     if (!res.get("Last-Modified")) res.set("Last-Modified", lmFallback);
     const { Readable } = await import("node:stream");
     Readable.fromWeb(upstream.body).pipe(res);
+    } catch (e) { next(e); }
   };
   app.get("/:bucket/*", handleGet);
   app.head("/:bucket/*", handleGet);
@@ -363,7 +365,13 @@ async function pruneEmptyDirs(wps, driveId, parentParts) {
     invalidateDir(driveId, dir.id);
     const c = await wps.children(driveId, dir.id);
     if ((c.items ?? []).length > 0) return;
-    await wps.post(`/v7/drives/${driveId}/files/batch_delete`, { file_ids: [dir.id] });
+    const t = await wps.post(`/v7/drives/${driveId}/files/batch_delete`, { file_ids: [dir.id] });
+    // 等删除任务完成，避免后续请求命中删除中的目录（400 文件不存在）
+    for (let n = 0; n < 60; n++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const m = await wps.taskMeta(t.task_id);
+      if (m.status === "success" || m.failed > 0) break;
+    }
     const gp = parts.slice(0, -1);
     const gpNode = gp.length ? await resolveNode(wps, driveId, gp) : { id: "0" };
     invalidateDir(driveId, gpNode.id);
