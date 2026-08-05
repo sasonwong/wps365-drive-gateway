@@ -101,6 +101,15 @@ X-Kso-Authorization: KSO-1 <accessKey>:<HMAC-SHA256>
 | 上传 | `POST .../request_upload` + `POST .../commit_upload` | kso.file.readwrite |
 | 删除 | `POST /v7/drives/{id}/files/{fid}/delete` | kso.file.readwrite |
 
+### 联调踩坑记录（重要）
+
+1. **KSO-1 签名空 body 语义**：`sha256(RequestBody)` 在 body 为空时是**空字符串**，不是空串的 SHA256 哈希（官方 Python 示例语义）。
+2. **签名内容必须用序列化后的 body**：签名中的 `sha256(body)` 是对实际发送的 `JSON.stringify(body)` 计算，不是 JS 对象。
+3. **上传实体文件强制 KSO-1 + Bearer**：`request_upload` 返回的存储 URL（`*.wps.cn` 域）上传时**必须同时带** KSO-1 签名头和 `Authorization: Bearer`（申请接口的登录凭据），否则 `403 userNotLogin`。与后台「接口签名」开关无关。
+4. **公网 `request_upload` 必传 `hashes`**（md5/sha256 至少一种），否则 400。
+5. **`on_name_conflict` 是字符串**枚举（`rename`/`overwrite`/...），不是对象。
+6. **「接口签名」开关关闭时**，kso 域接口只带 Bearer 即可；开启后全部 kso 域请求需 KSO-1 签名（CLI 0.3.1 不支持，会报 `invalid sign`）。
+
 ## 8. 配置示例
 
 ```jsonc
