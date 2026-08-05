@@ -33,13 +33,19 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
   const bucket = (name) => buckets.find((b) => b.name === name);
 
   // ── ListBuckets: GET / ────────────────────────────────────────
-  app.get("/", async (req, res) => {
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+  app.get("/", async (req, res) => {    const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Owner><ID>wps365</ID></Owner>
   <Buckets>${buckets.map((b) => `<Bucket><Name>${xmlEscape(b.name)}</Name></Bucket>`).join("")}</Buckets>
 </ListAllMyBucketsResult>`;
     res.type("xml").send(xml);
+  });
+
+  // ── HeadBucket: HEAD /{bucket}（rclone/aws cli 检查 bucket 存在性）──
+  app.head("/:bucket", (req, res) => {
+    const b = bucket(req.params.bucket);
+    if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "The specified bucket does not exist"));
+    res.status(200).end();
   });
 
   // ── ListObjectsV2: GET /{bucket}?list-type=2 ──────────────────
@@ -89,6 +95,8 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
     if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
     const file = await resolvePath(wps, b.driveId, req.params[0].split("/").filter(Boolean));
     if (!file) return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified key does not exist."));
+    // S3 语义：目录 key 不是对象，GET/HEAD 应 404（rclone 靠 HEAD 区分文件/目录）
+    if (file.type === "folder") return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified key does not exist."));
     const meta = await wps.meta(b.driveId, file.id);
     if (req.method === "HEAD") {
       res.set({ "Content-Length": meta.size ?? 0, "ETag": `"${meta.hash?.sum ?? ""}"`, "Last-Modified": new Date((meta.mtime ?? 0) * 1000).toUTCString(), "Content-Type": "application/octet-stream" });
@@ -103,10 +111,12 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
       return res.status(502).type("xml").send(errXml("InternalError", `download failed: ${upstream.status}`));
     }
     res.status(upstream.status);
+    const lmFallback = new Date((meta.mtime ?? 0) * 1000).toUTCString();
     for (const h of ["content-range", "accept-ranges", "content-length", "etag", "last-modified", "content-type"]) {
       const v = upstream.headers.get(h);
-      if (v) res.set(h, v);
+      if (v) res.set(h, h === "last-modified" ? v : v);
     }
+    if (!res.get("Last-Modified")) res.set("Last-Modified", lmFallback);
     const { Readable } = await import("node:stream");
     Readable.fromWeb(upstream.body).pipe(res);
   };
@@ -161,6 +171,13 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
       }
       next();
     } catch (e) { next(e); }
+  });
+
+  // ── PutBucket: PUT /{bucket}（rclone copyto 等会尝试创建；固定映射视为已存在）──
+  app.put("/:bucket", (req, res) => {
+    const b = bucket(req.params.bucket);
+    if (!b) return res.status(403).type("xml").send(errXml("AccessDenied", "bucket creation not supported"));
+    res.status(200).end();
   });
 
   // ── DeleteObjects: POST /{bucket}?delete（批量删除，映射 batch_delete）──
@@ -244,7 +261,10 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
           await wps.renameFile(b.driveId, dstFileId, name);
         }
         invalidateDir(b.driveId, parent.id);
-        return res.status(200).set("ETag", `"${srcFile.hash?.sum ?? ""}"`).end();
+        // S3 规范要求 CopyObjectResult XML 响应体（rclone 等客户端会反序列化）
+        const lm = new Date((srcFile.mtime ?? Date.now() / 1000) * 1000).toISOString();
+        return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ETag>"${srcFile.hash?.sum ?? ""}"</ETag><LastModified>${lm}</LastModified></CopyObjectResult>`);
       }
 
       // 普通 PUT（整块上传）
