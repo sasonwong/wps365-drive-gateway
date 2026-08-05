@@ -88,5 +88,18 @@ for (const k of ["plain.txt", "copy.txt", "big.bin"]) {
   check(`Delete ${k}`, r.status === 204, `${r.status}`);
 }
 
+// 8. DeleteObjects 批量删除（含不存在的 key + 文件夹）
+for (const k of ["del-a.txt", "del-b.txt"]) {
+  await call("PUT", `/${BUCKET}/${KEY}${k}`, { body: Buffer.from(k) });
+}
+r = await call("POST", `/${BUCKET}?delete`, { body: `<?xml version="1.0"?><Delete><Object><Key>${KEY}del-a.txt</Key></Object><Object><Key>${KEY}del-b.txt</Key></Object><Object><Key>${KEY}ghost.txt</Key></Object></Delete>` });
+check("DeleteObjects 200", r.status === 200, `${r.status} ${r.body}`);
+check("DeleteObjects 错误项", r.body.toString().includes("NoSuchKey"), r.body.toString().slice(0, 200));
+r = await call("HEAD", `/${BUCKET}/${KEY}del-a.txt`);
+check("批量删后对象消失", r.status === 404, `${r.status}`);
+// 删掉测试目录本身（文件夹走 batch_delete）
+r = await call("POST", `/${BUCKET}?delete`, { body: `<?xml version="1.0"?><Delete><Object><Key>${KEY.slice(0, -1)}</Key></Object></Delete>` });
+check("DeleteObjects 删文件夹", r.status === 200, `${r.status} ${r.body}`);
+
 console.log(failed === 0 ? "\n全部通过 🎉" : `\n${failed} 项失败 ❌`);
 process.exit(failed === 0 ? 0 : 1);

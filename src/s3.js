@@ -163,6 +163,54 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
     } catch (e) { next(e); }
   });
 
+  // ── DeleteObjects: POST /{bucket}?delete（批量删除，映射 batch_delete）──
+  app.post("/:bucket", async (req, res, next) => {
+    try {
+      if (readOnly) return res.status(403).type("xml").send(errXml("AccessDenied", "gateway is read-only"));
+      const b = bucket(req.params.bucket);
+      if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
+      if (req.query.delete === undefined) return next();
+      // 解析 XML body：<Delete><Object><Key>..</Key></Object>...<Quiet>..</Quiet></Delete>
+      const xml = req.rawBody.toString();
+      const keys = [...xml.matchAll(/<Key>([^<]*)<\/Key>/g)].map((m) =>
+        m[1].replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#x27;/g, "'"));
+      const quiet = /<Quiet>\s*true\s*<\/Quiet>/.test(xml);
+      if (keys.length === 0) return res.status(400).type("xml").send(errXml("MalformedXML", "no keys"));
+
+      // 逐个解析 key → file_id（路径解析走目录缓存，代价小）
+      const deleted = [], errors = [];
+      const batch = []; // { driveId, fileId, key }
+      for (const key of keys) {
+        const file = await resolvePath(wps, b.driveId, key.split("/").filter(Boolean));
+        if (!file) errors.push(`  <Error><Key>${xmlEscape(key)}</Key><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>`);
+        else batch.push({ driveId: b.driveId, fileId: file.id, key });
+      }
+      // 一次 batch_delete 全删（文件夹也支持）；分 200 一批
+      for (let i = 0; i < batch.length; i += 200) {
+        const chunk = batch.slice(i, i + 200);
+        const t = await wps.post(`/v7/drives/${b.driveId}/files/batch_delete`, { file_ids: chunk.map((c) => c.fileId) });
+        for (let n = 0; n < 60; n++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const m = await wps.taskMeta(t.task_id);
+          if (m.failed > 0) {
+            errors.push(`  <Error><Key>${xmlEscape(chunk[0].key)}</Key><Code>InternalError</Code><Message>batch delete task failed</Message></Error>`);
+            break;
+          }
+          if (m.status === "success") break;
+        }
+      }
+      if (!quiet) for (const c of batch) deleted.push(`  <Deleted><Key>${xmlEscape(c.key)}</Key></Deleted>`);
+      // 失效涉及目录缓存
+      for (const c of batch) {
+        const parentParts = c.key.split("/").filter(Boolean).slice(0, -1);
+        const parent = parentParts.length ? await resolveNode(wps, b.driveId, parentParts) : { id: "0" };
+        invalidateDir(b.driveId, parent.id);
+      }
+      res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\n${deleted.join("\n")}${errors.join("\n")}\n</DeleteResult>`);
+    } catch (e) { next(e); }
+  });
+
   // ── PutObject / CopyObject / UploadPart: PUT /{bucket}/{key} ──
   app.put("/:bucket/*", async (req, res, next) => {
     try {
