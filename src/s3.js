@@ -11,7 +11,7 @@ function errXml(code, msg) {
   return `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${xmlEscape(msg)}</Message></Error>`;
 }
 
-export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
+export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmptyDirs = true }) {
   const app = express();
   app.disable("x-powered-by");
 
@@ -96,8 +96,15 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
     if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
     const file = await resolvePath(wps, b.driveId, req.params[0].split("/").filter(Boolean));
     if (!file) return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified key does not exist."));
-    // S3 语义：目录 key 不是对象，GET/HEAD 应 404（rclone 靠 HEAD 区分文件/目录）
-    if (file.type === "folder") return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified key does not exist."));
+    // rclone 判定：HEAD 无尾斜杠 200=文件 / 404=目录（NewFs）；
+    // HEAD 带尾斜杠（directory marker，MinIO 兼容）= 200 + application/directory（Update 验证）
+    if (file.type === "folder") {
+      if (req.params[0].endsWith("/")) {
+        res.set({ "Content-Type": "application/directory", "Content-Length": 0, "ETag": `"${file.id}"` });
+        return res.status(200).end();
+      }
+      return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified key does not exist."));
+    }
     const meta = await wps.meta(b.driveId, file.id);
     if (req.method === "HEAD") {
       res.set({ "Content-Length": meta.size ?? 0, "ETag": `"${meta.hash?.sum ?? ""}"`, "Last-Modified": new Date((meta.mtime ?? 0) * 1000).toUTCString(), "Content-Type": "application/octet-stream" });
@@ -219,14 +226,25 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
         }
       }
       if (!quiet) for (const c of batch) deleted.push(`  <Deleted><Key>${xmlEscape(c.key)}</Key></Deleted>`);
-      // 失效涉及目录缓存 + 清理变空目录
-      const pruned = new Set();
+      // 失效涉及目录缓存（无条件：删除改变了目录内容）+ 清理变空目录（可配置）
       for (const c of batch) {
         const parentParts = c.key.split("/").filter(Boolean).slice(0, -1);
-        const pk = parentParts.join("/");
-        if (!pruned.has(pk)) {
-          pruned.add(pk);
-          await pruneEmptyDirs(wps, b.driveId, parentParts);
+        if (parentParts.length) {
+          const parent = await resolveNode(wps, b.driveId, parentParts);
+          if (parent) invalidateDir(b.driveId, parent.id);
+        } else {
+          invalidateDir(b.driveId, "0");
+        }
+      }
+      if (pruneEmptyDirs) {
+        const pruned = new Set();
+        for (const c of batch) {
+          const parentParts = c.key.split("/").filter(Boolean).slice(0, -1);
+          const pk = parentParts.join("/");
+          if (!pruned.has(pk)) {
+            pruned.add(pk);
+            await pruneEmptyFolders(wps, b.driveId, parentParts);
+          }
         }
       }
       res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
@@ -274,6 +292,16 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
       }
 
       // 普通 PUT（整块上传）
+      const rawKey = req.params[0];
+      // S3 directory marker：PUT 尾斜杠 key = 创建文件夹（rclone directory_markers / MinIO 语义）
+      if (rawKey.endsWith("/")) {
+        const name = parts.pop();
+        const parent = await ensureDirPath(wps, b.driveId, parts);
+        if (!parent) return res.status(404).type("xml").send(errXml("NoSuchKey", "parent directory not found"));
+        const node = await wps.createFolder(b.driveId, parent.id, name);
+        invalidateDir(b.driveId, parent.id);
+        return res.status(200).set("ETag", `"${node.id}"`).end();
+      }
       const name = parts.pop();
       const parent = await ensureDirPath(wps, b.driveId, parts);
       if (!parent) return res.status(404).type("xml").send(errXml("NoSuchKey", "parent directory not found"));
@@ -313,9 +341,16 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
       } else {
         await wps.deleteFile(b.driveId, file.id);
       }
-      // 失效文件所在目录缓存 + 清理变空目录
+      // 无条件失效父目录缓存（删除改变目录内容；含删除目录本身的情形）
       const parentParts = parts.slice(0, -1);
-      await pruneEmptyDirs(wps, b.driveId, parentParts);
+      if (parentParts.length) {
+        const parent = await resolveNode(wps, b.driveId, parentParts);
+        if (parent) invalidateDir(b.driveId, parent.id);
+      } else {
+        invalidateDir(b.driveId, "0");
+      }
+      // 清理变空目录（可配置关闭）
+      if (pruneEmptyDirs) await pruneEmptyFolders(wps, b.driveId, parentParts);
       res.status(204).end();
     } catch (e) { next(e); }
   });
@@ -357,7 +392,7 @@ function invalidateDir(driveId, parentId) {
 
 // 删除对象后清理变空的父目录（WPS 目录是真实实体，S3 语义下 purge/rm 会留空目录）
 // 从最深层父目录向上递归；有内容即停。下次 PUT 会自动重建目录。
-async function pruneEmptyDirs(wps, driveId, parentParts) {
+async function pruneEmptyFolders(wps, driveId, parentParts) {
   for (let i = parentParts.length; i > 0; i--) {
     const parts = parentParts.slice(0, i);
     const dir = await resolveNode(wps, driveId, parts);

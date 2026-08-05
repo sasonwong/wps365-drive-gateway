@@ -38,6 +38,7 @@ const app = createS3App({
   creds: cfg.s3Credentials,
   readOnly: cfg.readOnly ?? false,
   tokenFile,
+  pruneEmptyDirs: cfg.pruneEmptyDirs ?? true,
 });
 
 app.listen(cfg.port ?? 9000, cfg.host ?? "127.0.0.1", () => {

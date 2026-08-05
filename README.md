@@ -10,6 +10,7 @@
 - ✅ 支持 WPS 侧 **KSO-1 签名**（开发者后台「接口签名」开启时也能用）
 - ✅ delegated token 自动续期（refresh_token 长期有效，首次授权后无需人工干预）
 - ✅ 删除进回收站、只读模式、多凭证
+- ✅ 空目录自动清理（`pruneEmptyDirs` 可关）+ S3 directory marker（PUT `dir/` 建文件夹）
 - ✅ 纯 Node.js（≥20），仅依赖 `express` + `aws4`
 
 ## 快速开始
@@ -81,3 +82,11 @@ docker compose logs -f wps365-drive-gateway
 ## License
 
 MIT
+
+## 目录语义与空目录策略
+
+WPS 的"文件夹"是真实实体，S3 协议没有目录对象，两者差异通过以下机制弥合：
+
+- **删除后自动清理空目录**（默认开启）：删除对象后，若父目录变空则级联删除（`rclone purge` 后不留空文件夹）。设置 `"pruneEmptyDirs": false` 可关闭——关闭后删除文件不会删目录，可保留手动创建的空目录结构。
+- **创建文件夹**：PUT 以 `/` 结尾的 key（S3 directory marker，如 `aws s3api put-object --key "dir/"`）；rclone 需在配置中加 `directory_markers = true` 后 `mkdir` 才生效。
+- **rclone 注意**：`rmdir`/`rmdirs` 对 S3 后端是 no-op（rclone 设计如此，不发请求）；删空目录请用网关（`DELETE dir/`）或关掉 prune 后用 purge + 手动清理。HEAD 目录 key 无尾斜杠返回 404、带尾斜杠返回 200（`application/directory`），与 rclone 1.71 的判定逻辑对齐。

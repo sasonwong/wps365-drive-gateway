@@ -2,7 +2,10 @@
   "host": "127.0.0.1",
   "port": 9000,
   "s3Credentials": [
-    { "accessKey": "gateway-admin", "secretKey": "change-me" }
+    {
+      "accessKey": "gateway-admin",
+      "secretKey": "change-me"
+    }
   ],
   "wps": {
     "clientId": "AK-your-app-id",
@@ -14,8 +17,15 @@
     "apiBase": "https://openapi.wps.cn"
   },
   "buckets": [
-    { "name": "personal", "driveId": "dr_your_personal_drive" },
-    { "name": "team-docs", "driveId": "dr_your_team_drive" }
+    {
+      "name": "personal",
+      "driveId": "dr_your_personal_drive"
+    },
+    {
+      "name": "team-docs",
+      "driveId": "dr_your_team_drive"
+    }
   ],
-  "readOnly": false
+  "readOnly": false,
+  "pruneEmptyDirs": true
 }
