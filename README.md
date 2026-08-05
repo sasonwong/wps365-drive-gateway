@@ -43,6 +43,18 @@ access_key_id = gateway-admin
 secret_access_key = change-me
 ```
 
+## Docker 部署
+
+```bash
+docker compose up -d --build
+# 首次启动：从日志里拿设备码授权链接，浏览器打开完成登录
+docker compose logs -f wps365-drive-gateway
+```
+
+- `config.json` 挂载为只读（不入镜像），按 `config.example.json` 准备
+- `./data/tokens.json` 持久化登录态（refresh_token），重启不重新授权
+- 映射端口/限制监听地址按需改 `docker-compose.yml`
+
 ## 配置
 
 见 [docs/DESIGN.md §8](docs/DESIGN.md) 与 `config.example.json`。关键项：

@@ -1,0 +1,14 @@
+services:
+  wps365-drive-gateway:
+    build: .
+    container_name: wps365-drive-gateway
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      # 配置与凭证（tokens.json 自动生成，落盘持久化）
+      - ./config.json:/app/config.json:ro
+      - ./data:/app/data
+    environment:
+      # 覆盖默认 token 路径（持久化到 volume）
+      WPS_GATEWAY_TOKEN: /app/data/tokens.json
