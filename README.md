@@ -4,11 +4,11 @@
 
 ## 特性
 
-- ✅ S3 兼容：`ListBuckets` / `ListObjectsV2` / `GetObject` / `PutObject` / `DeleteObject` / `HeadObject`
+- ✅ S3 兼容：`ListBuckets` / `ListObjectsV2` / `GetObject`(Range) / `PutObject` / `DeleteObject` / `HeadObject` / `CopyObject` / **Multipart Upload**
 - ✅ 个人盘 + 团队文档库（`/v7/doclibs`）
 - ✅ AWS Signature V4 鉴权（静态 AK/SK，标准 S3 SDK 零改造接入）
 - ✅ 支持 WPS 侧 **KSO-1 签名**（开发者后台「接口签名」开启时也能用）
-- ✅ delegated token 自动续期（首次授权后无需人工干预）
+- ✅ delegated token 自动续期（refresh_token 长期有效，首次授权后无需人工干预）
 - ✅ 删除进回收站、只读模式、多凭证
 - ✅ 纯 Node.js（≥20），仅依赖 `express` + `aws4`
 

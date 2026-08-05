@@ -49,6 +49,7 @@ export class WpsClient {
     const poll = new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:device_code",
       client_id: this.cfg.clientId,
+      client_secret: this.cfg.clientSecret,
       device_code: d.device_code,
     });
     for (;;) {
@@ -59,9 +60,16 @@ export class WpsClient {
         body: poll,
       });
       const td = await t.json();
-      if (td.access_token) { this.setTokens(td); console.log("✓ 登录成功"); return; }
-      if (td.error === "authorization_pending") continue;
-      throw new Error(`token: ${td.error}: ${td.error_description ?? ""}`);
+      // WPS 的轮询响应是 {code, msg} 包装：pending=50000006，成功时 data.access_token
+      if (td.access_token || td.data?.access_token) {
+        this.setTokens(td.data?.access_token ? { ...td.data, refresh_token: td.data.refresh_token ?? this.refreshToken } : td);
+        console.log("✓ 登录成功"); return;
+      }
+      const errCode = td.code ?? td.error;
+      if (errCode === 50000006 || td.error === "authorization_pending") continue;
+      if (td.error === "slow_down") { await new Promise((res) => setTimeout(res, 5000)); continue; }
+      console.log("[login] 原始响应:", JSON.stringify(td));
+      throw new Error(`token: ${td.error ?? td.msg}: ${td.error_description ?? ""}`);
     }
   }
 
@@ -73,7 +81,7 @@ export class WpsClient {
   }
 
   async refresh() {
-    if (!this.refreshToken) return;
+    if (!this.refreshToken) throw new Error("无 refresh_token，需要重新设备码登录");
     const r = await fetch(this.cfg.tokenUrl, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -127,8 +135,8 @@ export class WpsClient {
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.code !== 0) {
-      // token 过期时重试一次
-      if (r.status === 401 || data.code === 400000003) {
+      // token 过期/失效时用 refresh_token 重试一次
+      if (r.status === 401 || data.code === 400000003 || data.code === 401000001) {
         await this.refresh();
         return this.request(method, uri, body, opts);
       }
@@ -190,4 +198,66 @@ export class WpsClient {
   async commitUpload(driveId, parentId, uploadId) {
     return this.post(`/v7/drives/${driveId}/files/${parentId}/commit_upload`, { upload_id: uploadId });
   }
+
+  // ── 分块上传（WPS 固定块大小，服务端下发 part_size）────────────
+  // create task 必须提供真实 size + 整体 sha256（公网强制）
+  async multipartCreate(driveId, parentId, name, size, sha256Hex) {
+    return this.post(`/v7/drives/${driveId}/files/${parentId}/create_multipart_upload_task`, {
+      name, size, mode: "sequential",
+      hashes: [{ type: "sha256", sum: sha256Hex }],
+      on_name_conflict: "rename",
+    });
+  }
+
+  // 上传单个分块：PUT upload_addr?part_number=N，KSO-1 + Bearer + Content-MD5
+  async multipartPutPart(uploadAddr, partNumber, data) {
+    const url = new URL(uploadAddr);
+    const uri = url.pathname + url.search + (url.search ? "&" : "?") + `part_number=${partNumber}`;
+    const headers = this.kso1Headers("PUT", uri, data, "application/octet-stream");
+    headers["Content-Length"] = data.length;
+    headers["Content-MD5"] = crypto.createHash("md5").update(data).digest("base64");
+    headers["Authorization"] = `Bearer ${this.accessToken}`;
+    const up = await fetch(url.origin + uri, { method: "PUT", headers, body: data });
+    if (!up.ok) throw new Error(`multipart part ${partNumber}: ${up.status} ${(await up.text()).slice(0, 120)}`);
+  }
+
+  // 合并分块并建文件；合并中可能返回 409007001，至少 2 秒后重试
+  async multipartCommit(uploadId) {
+    for (let i = 0; i < 6; i++) {
+      try {
+        return await this.post(`/v7/multipart_upload_tasks/${uploadId}/commit`, {});
+      } catch (e) {
+        if (e.code !== 409007001 || i === 5) throw e;
+        await new Promise((r) => setTimeout(r, 2500));
+      }
+    }
+  }
+
+  async multipartAbort(uploadId) {
+    return this.post(`/v7/multipart_upload_tasks/${uploadId}/abort`, {});
+  }
+
+  // ── 复制（异步任务 + 轮询）────────────────────────────────────
+  // 返回复制出的文件 id（用于 S3 CopyObject 的目标名重命名）
+  async copyFile(driveId, srcFileId, dstDriveId, dstParentId) {
+    const t = await this.post(`/v7/drives/${driveId}/files/batch_copy`, {
+      dst_drive_id: dstDriveId, dst_parent_id: dstParentId, file_ids: [srcFileId],
+    });
+    const taskId = t.task_id;
+    for (let i = 0; i < 60; i++) { // 最多等 ~2 分钟
+      await new Promise((r) => setTimeout(r, 2000));
+      const meta = await this.taskMeta(taskId);
+      if (meta.failed > 0) throw new Error(`copy task failed: ${taskId}`);
+      if (meta.status === "success" || meta.status === "done") {
+        return meta.file_pairs?.[0]?.dst_file_id;
+      }
+    }
+    throw new Error(`copy task timeout: ${taskId}`);
+  }
+
+  renameFile(driveId, fileId, dstName) {
+    return this.post(`/v7/drives/${driveId}/files/${fileId}/rename`, { dst_name: dstName });
+  }
+
+  taskMeta(taskId) { return this.get(`/v7/drive_tasks/${taskId}/meta`); }
 }
