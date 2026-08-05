@@ -16,7 +16,7 @@
 ## 快速开始
 
 ```bash
-git clone <repo-url> && cd wps365-drive-gateway
+git clone https://github.com/sasonwong/wps365-drive-gateway && cd wps365-drive-gateway
 npm install
 cp config.example.json config.json   # 填入你的 client_id / client_secret / bucket 映射
 node src/index.js
@@ -75,14 +75,6 @@ docker compose logs -f wps365-drive-gateway
 - `tokens.json`（refresh_token）权限 600，请勿提交到 git
 - 完整威胁模型见 [docs/DESIGN.md §5](docs/DESIGN.md)
 
-## 设计文档
-
-[docs/DESIGN.md](docs/DESIGN.md) — 架构、映射、鉴权、API 依赖清单、功能取舍。
-
-## License
-
-MIT
-
 ## 目录语义与空目录策略
 
 WPS 的"文件夹"是真实实体，S3 协议没有目录对象，两者差异通过以下机制弥合：
@@ -90,3 +82,11 @@ WPS 的"文件夹"是真实实体，S3 协议没有目录对象，两者差异�
 - **删除后自动清理空目录**（默认开启）：删除对象后，若父目录变空则级联删除（`rclone purge` 后不留空文件夹）。设置 `"pruneEmptyDirs": false` 可关闭——关闭后删除文件不会删目录，可保留手动创建的空目录结构。
 - **创建文件夹**：PUT 以 `/` 结尾的 key（S3 directory marker，如 `aws s3api put-object --key "dir/"`）；rclone 需在配置中加 `directory_markers = true` 后 `mkdir` 才生效。
 - **rclone 注意**：`rmdir`/`rmdirs` 对 S3 后端是 no-op（rclone 设计如此，不发请求）；删空目录请用网关（`DELETE dir/`）或关掉 prune 后用 purge + 手动清理。HEAD 目录 key 无尾斜杠返回 404、带尾斜杠返回 200（`application/directory`），与 rclone 1.71 的判定逻辑对齐。
+
+## 设计文档
+
+[docs/DESIGN.md](docs/DESIGN.md) — 架构、映射、鉴权、API 依赖清单、功能取舍。
+
+## License
+
+MIT
