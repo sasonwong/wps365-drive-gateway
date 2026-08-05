@@ -1,5 +1,6 @@
 // S3 协议层：路由 + XML 响应
 import express from "express";
+import crypto from "node:crypto";
 import { parseAuth, verifySigV4, sigV4Error } from "./sigv4.js";
 
 function xmlEscape(s) {
@@ -93,20 +94,112 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
       res.set({ "Content-Length": meta.size ?? 0, "ETag": `"${meta.hash?.sum ?? ""}"`, "Last-Modified": new Date((meta.mtime ?? 0) * 1000).toUTCString(), "Content-Type": "application/octet-stream" });
       return res.end();
     }
+    // 网关内部代理下载：存储网关要求 Bearer（客户端跟随 302 会丢凭据）
     const url = await wps.downloadUrl(b.driveId, file.id);
-    // 302 到 WPS 临时下载地址，客户端跟随
-    res.redirect(url);
+    const headers = { Authorization: `Bearer ${wps.accessToken}` };
+    if (req.headers.range) headers.Range = req.headers.range;
+    const upstream = await fetch(url, { headers, redirect: "follow" });
+    if (!upstream.ok && upstream.status !== 206) {
+      return res.status(502).type("xml").send(errXml("InternalError", `download failed: ${upstream.status}`));
+    }
+    res.status(upstream.status);
+    for (const h of ["content-range", "accept-ranges", "content-length", "etag", "last-modified", "content-type"]) {
+      const v = upstream.headers.get(h);
+      if (v) res.set(h, v);
+    }
+    const { Readable } = await import("node:stream");
+    Readable.fromWeb(upstream.body).pipe(res);
   };
   app.get("/:bucket/*", handleGet);
   app.head("/:bucket/*", handleGet);
 
-  // ── PutObject: PUT /{bucket}/{key} ────────────────────────────
+  // ── Multipart upload 状态（缓冲式：Complete 时统一建 WPS 任务）──
+  // ponytail: 内存缓冲，单文件过大（>2GB）会吃紧；需要时改 spool 磁盘
+  const mpu = new Map(); // uploadId → { b, parts: Map<number,Buffer>, name, key }
+
+  // CreateMultipartUpload: POST /{bucket}/{key}?uploads
+  // CompleteMultipartUpload: POST /{bucket}/{key}?uploadId=...
+  app.post("/:bucket/*", async (req, res, next) => {
+    try {
+      if (readOnly) return res.status(403).type("xml").send(errXml("AccessDenied", "gateway is read-only"));
+      const b = bucket(req.params.bucket);
+      if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
+      const parts = req.params[0].split("/").filter(Boolean);
+      const name = parts.pop();
+      if (req.query.uploads !== undefined) { // Create
+        const uploadId = crypto.randomUUID();
+        mpu.set(uploadId, { b, parts, name, chunks: new Map() });
+        return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>${xmlEscape(b.name)}</Bucket>
+  <Key>${xmlEscape(req.params[0])}</Key>
+  <UploadId>${uploadId}</UploadId>
+</InitiateMultipartUploadResult>`);
+      }
+      if (req.query.uploadId) { // Complete：拼接全部 part → 建 WPS 任务 → 按 WPS 块大小上传
+        const up = mpu.get(req.query.uploadId);
+        if (!up) return res.status(404).type("xml").send(errXml("NoSuchUpload", "The specified upload does not exist."));
+        const parent = await ensureDirPath(wps, b.driveId, up.parts);
+        const body = Buffer.concat([...up.chunks.values()]);
+        const sha256 = crypto.createHash("sha256").update(body).digest("hex");
+        const task = await wps.multipartCreate(b.driveId, parent.id, up.name, body.length, sha256);
+        // 按 WPS 固定块大小重新切块上传（S3 客户端块大小不受控）
+        for (let i = 0; i < task.part_count; i++) {
+          const chunk = body.subarray(i * task.part_size, (i + 1) * task.part_size);
+          await wps.multipartPutPart(task.upload_addr, i + 1, chunk);
+        }
+        await wps.multipartCommit(task.upload_id);
+        mpu.delete(req.query.uploadId);
+        invalidateDir(b.driveId, parent.id);
+        return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Location>${xmlEscape(b.name)}</Location>
+  <Bucket>${xmlEscape(b.name)}</Bucket>
+  <Key>${xmlEscape(req.params[0])}</Key>
+  <ETag>"${sha256}"</ETag>
+</CompleteMultipartUploadResult>`);
+      }
+      next();
+    } catch (e) { next(e); }
+  });
+
+  // ── PutObject / CopyObject / UploadPart: PUT /{bucket}/{key} ──
   app.put("/:bucket/*", async (req, res, next) => {
     try {
       if (readOnly) return res.status(403).type("xml").send(errXml("AccessDenied", "gateway is read-only"));
       const b = bucket(req.params.bucket);
       if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
       const parts = req.params[0].split("/").filter(Boolean);
+
+      // UploadPart: 缓冲到 uploadId 对应会话（Complete 时统一上传）
+      if (req.query.uploadId && req.query.partNumber) {
+        const up = mpu.get(req.query.uploadId);
+        if (!up) return res.status(404).type("xml").send(errXml("NoSuchUpload", "The specified upload does not exist."));
+        up.chunks.set(parseInt(req.query.partNumber, 10), Buffer.from(req.rawBody));
+        return res.status(200).set("ETag", `"${crypto.createHash("md5").update(req.rawBody).digest("hex")}"`).end();
+      }
+
+      // CopyObject: x-amz-copy-source=/srcbucket/srckey
+      if (req.headers["x-amz-copy-source"]) {
+        const src = decodeURIComponent(req.headers["x-amz-copy-source"]).replace(/^\//, "");
+        const slash = src.indexOf("/");
+        const srcBucket = src.slice(0, slash);
+        const srcKey = src.slice(slash + 1);
+        const sb = bucket(srcBucket);
+        if (!sb) return res.status(404).type("xml").send(errXml("NoSuchBucket", "source bucket not found"));
+        const srcFile = await resolvePath(wps, sb.driveId, srcKey.split("/").filter(Boolean));
+        if (!srcFile) return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified source key does not exist."));
+        const name = parts.pop();
+        const parent = await ensureDirPath(wps, b.driveId, parts);
+        const dstFileId = await wps.copyFile(sb.driveId, srcFile.id, b.driveId, parent.id);
+        if (dstFileId && name !== srcFile.name) {
+          await wps.renameFile(b.driveId, dstFileId, name);
+        }
+        invalidateDir(b.driveId, parent.id);
+        return res.status(200).set("ETag", `"${srcFile.hash?.sum ?? ""}"`).end();
+      }
+
+      // 普通 PUT（整块上传）
       const name = parts.pop();
       const parent = await ensureDirPath(wps, b.driveId, parts);
       if (!parent) return res.status(404).type("xml").send(errXml("NoSuchKey", "parent directory not found"));
@@ -114,20 +207,31 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile }) {
       const { upload_id, store_request } = await wps.requestUpload(b.driveId, parent.id, name, req.rawBody);
       await wps.uploadStore(store_request, req.rawBody);
       await wps.commitUpload(b.driveId, parent.id, upload_id);
+      invalidateDir(b.driveId, parent.id);
       res.status(200).set("ETag", `"${upload_id}"`).end();
     } catch (e) { next(e); }
   });
 
-  // ── DeleteObject: DELETE /{bucket}/{key} ──────────────────────
+  // ── DeleteObject / AbortMultipartUpload: DELETE /{bucket}/{key} ──
   app.delete("/:bucket/*", async (req, res, next) => {
     try {
       if (readOnly) return res.status(403).type("xml").send(errXml("AccessDenied", "gateway is read-only"));
       const b = bucket(req.params.bucket);
       if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
+      if (req.query.uploadId) { // Abort
+        const up = mpu.get(req.query.uploadId);
+        if (!up) return res.status(404).type("xml").send(errXml("NoSuchUpload", "The specified upload does not exist."));
+        mpu.delete(req.query.uploadId);
+        return res.status(204).end();
+      }
       const parts = req.params[0].split("/").filter(Boolean);
       const file = await resolvePath(wps, b.driveId, parts);
       if (!file) return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified key does not exist."));
       await wps.deleteFile(b.driveId, file.id);
+      // 失效文件所在目录缓存（父目录 = 去掉最后一层的 parts）
+      const parentParts = parts.slice(0, -1);
+      const parent = parentParts.length ? await resolveNode(wps, b.driveId, parentParts) : { id: "0" };
+      invalidateDir(b.driveId, parent.id);
       res.status(204).end();
     } catch (e) { next(e); }
   });
@@ -160,6 +264,11 @@ async function childrenMap(wps, driveId, parentId) {
   const map = new Map(items.map((f) => [f.name, f]));
   dirCache.set(ck, { map, ts: Date.now() });
   return map;
+}
+
+// 写入操作后失效父目录缓存（PUT/DELETE/Copy/Complete 都会改变目录内容）
+function invalidateDir(driveId, parentId) {
+  dirCache.delete(`${driveId}/${parentId}`);
 }
 
 async function resolveNode(wps, driveId, parts) {
