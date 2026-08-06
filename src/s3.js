@@ -66,7 +66,7 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
         .map((f) => `<Contents>
   <Key>${xmlEscape(f.key)}</Key>
   <Size>${f.size ?? 0}</Size>
-  <LastModified>${new Date((f.mtime ?? 0) * 1000).toISOString()}</LastModified>
+  <LastModified>${new Date((parseFloat(keyMtime(b, f.key)) || f.mtime || 0) * 1000).toISOString()}</LastModified>
   <ETag>"${f.etag ?? ""}"</ETag>
   <StorageClass>STANDARD</StorageClass>
 </Contents>`).join("");
@@ -94,7 +94,21 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
     try {
     const b = bucket(req.params.bucket);
     if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
-    const file = await resolvePath(wps, b.driveId, req.params[0].split("/").filter(Boolean));
+    let file = await resolvePath(wps, b.driveId, req.params[0].split("/").filter(Boolean));
+    // 近期上传过的 key：WPS children 最终一致延迟，延迟后重查一次
+    if (!file) {
+      const rk = `${b.driveId}/${req.params[0]}`;
+      if (recentUploads.has(rk) && Date.now() - recentUploads.get(rk) < 60_000) {
+        const parentParts = req.params[0].split("/").filter(Boolean).slice(0, -1);
+        if (parentParts.length) {
+          const parent = await resolveNode(wps, b.driveId, parentParts);
+          if (parent) invalidateDir(b.driveId, parent.id);
+        }
+        await new Promise((r) => setTimeout(r, 700));
+        file = await resolvePath(wps, b.driveId, req.params[0].split("/").filter(Boolean));
+        if (file) recentUploads.delete(rk);
+      }
+    }
     if (!file) return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified key does not exist."));
     // rclone 判定：HEAD 无尾斜杠 200=文件 / 404=目录（NewFs）；
     // HEAD 带尾斜杠（directory marker，MinIO 兼容）= 200 + application/directory（Update 验证）
@@ -106,8 +120,13 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
       return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified key does not exist."));
     }
     const meta = await wps.meta(b.driveId, file.id);
+    const mtime = parseFloat(keyMtime(b, req.params[0])) || meta.mtime || 0;
     if (req.method === "HEAD") {
-      res.set({ "Content-Length": meta.size ?? 0, "ETag": `"${meta.hash?.sum ?? ""}"`, "Last-Modified": new Date((meta.mtime ?? 0) * 1000).toUTCString(), "Content-Type": "application/octet-stream" });
+      // rclone 从 X-Amz-Meta-Mtime 读 modtime（纳秒精度，原样字符串），Last-Modified 只是 fallback
+      const headers = { "Content-Length": meta.size ?? 0, "ETag": `"${meta.hash?.sum ?? ""}"`, "Last-Modified": new Date(mtime * 1000).toUTCString(), "Content-Type": "application/octet-stream" };
+      const mt = keyMtime(b, req.params[0]);
+      if (mt) headers["X-Amz-Meta-Mtime"] = mt;
+      res.set(headers);
       return res.end();
     }
     // 网关内部代理下载：存储网关要求 Bearer（客户端跟随 302 会丢凭据）
@@ -119,7 +138,7 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
       return res.status(502).type("xml").send(errXml("InternalError", `download failed: ${upstream.status}`));
     }
     res.status(upstream.status);
-    const lmFallback = new Date((meta.mtime ?? 0) * 1000).toUTCString();
+    const lmFallback = new Date((parseFloat(keyMtime(b, req.params[0])) || meta.mtime || 0) * 1000).toUTCString();
     for (const h of ["content-range", "accept-ranges", "content-length", "etag", "last-modified", "content-type"]) {
       const v = upstream.headers.get(h);
       if (v) res.set(h, h === "last-modified" ? v : v);
@@ -136,6 +155,19 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
   // ponytail: 内存缓冲，单文件过大（>2GB）会吃紧；需要时改 spool 磁盘
   const mpu = new Map(); // uploadId → { b, parts: Map<number,Buffer>, name, key }
 
+  // rclone 用 X-Amz-Meta-Mtime 做同步对比；网关内存记录（重启后需重跑一轮收敛）
+  // ponytail: 内存 map，重启丢失；需要持久化时落盘 json
+  const mtimeMap = new Map(); // `${driveId}/${key}` → x-amz-meta-mtime 原样字符串（rclone 纳秒精度，浮点会丢位）
+  const saveMtime = (req, b, key) => {
+    const mt = req.headers["x-amz-meta-mtime"];
+    if (mt) mtimeMap.set(`${b.driveId}/${key}`, mt);
+  };
+  const keyMtime = (b, key) => mtimeMap.get(`${b.driveId}/${key}`);
+
+  // 近期上传记录：HEAD 404 时延迟重查，消除 WPS children 最终一致窗口
+  const recentUploads = new Map(); // `${driveId}/${key}` → ts
+  const markUploaded = (b, key) => recentUploads.set(`${b.driveId}/${key}`, Date.now());
+
   // CreateMultipartUpload: POST /{bucket}/{key}?uploads
   // CompleteMultipartUpload: POST /{bucket}/{key}?uploadId=...
   app.post("/:bucket/*", async (req, res, next) => {
@@ -147,7 +179,7 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
       const name = parts.pop();
       if (req.query.uploads !== undefined) { // Create
         const uploadId = crypto.randomUUID();
-        mpu.set(uploadId, { b, parts, name, chunks: new Map() });
+        mpu.set(uploadId, { b, parts, name, chunks: new Map(), mtime: req.headers["x-amz-meta-mtime"] });
         return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Bucket>${xmlEscape(b.name)}</Bucket>
@@ -167,9 +199,13 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
           const chunk = body.subarray(i * task.part_size, (i + 1) * task.part_size);
           await wps.multipartPutPart(task.upload_addr, i + 1, chunk);
         }
-        await wps.multipartCommit(task.upload_id);
+        const commit = await wps.multipartCommit(task.upload_id);
         mpu.delete(req.query.uploadId);
-        invalidateDir(b.driveId, parent.id);
+        // 注入缓存（同 PUT：HEAD 验证不依赖 WPS list 延迟）
+        seedCache(wps, b.driveId, parent.id, commit ?? { id: "", name: up.name, size: body.length, type: "file" });
+        // mtime 只在 CreateMultipartUpload 请求里带（rclone multipart 语义），Complete 请求没有
+        if (up.mtime) mtimeMap.set(`${b.driveId}/${req.params[0]}`, up.mtime);
+        markUploaded(b, req.params[0]);
         return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Location>${xmlEscape(b.name)}</Location>
@@ -285,8 +321,10 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
           await wps.renameFile(b.driveId, dstFileId, name);
         }
         invalidateDir(b.driveId, parent.id);
+        saveMtime(req, b, req.params[0]);
+        markUploaded(b, req.params[0]);
         // S3 规范要求 CopyObjectResult XML 响应体（rclone 等客户端会反序列化）
-        const lm = new Date((srcFile.mtime ?? Date.now() / 1000) * 1000).toISOString();
+        const lm = new Date((keyMtime(sb, srcKey) ?? srcFile.mtime ?? Date.now() / 1000) * 1000).toISOString();
         return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ETag>"${srcFile.hash?.sum ?? ""}"</ETag><LastModified>${lm}</LastModified></CopyObjectResult>`);
       }
@@ -298,18 +336,26 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
         const name = parts.pop();
         const parent = await ensureDirPath(wps, b.driveId, parts);
         if (!parent) return res.status(404).type("xml").send(errXml("NoSuchKey", "parent directory not found"));
-        const node = await wps.createFolder(b.driveId, parent.id, name);
+        // 幂等：目录已存在则直接 200（createFolder 的 rename 会生成 (N) 目录）
+        const map = await childrenMap(wps, b.driveId, parent.id);
+        const node = map.get(name)?.type === "folder" ? { id: map.get(name).id } : await wps.createFolder(b.driveId, parent.id, name);
         invalidateDir(b.driveId, parent.id);
         return res.status(200).set("ETag", `"${node.id}"`).end();
       }
       const name = parts.pop();
+      if (name.startsWith(".")) {
+        return res.status(400).type("xml").send(errXml("InvalidArgument", `WPS 云盘不支持点号开头的文件名: ${name}`));
+      }
       const parent = await ensureDirPath(wps, b.driveId, parts);
       if (!parent) return res.status(404).type("xml").send(errXml("NoSuchKey", "parent directory not found"));
 
       const { upload_id, store_request } = await wps.requestUpload(b.driveId, parent.id, name, req.rawBody);
       await wps.uploadStore(store_request, req.rawBody);
-      await wps.commitUpload(b.driveId, parent.id, upload_id);
-      invalidateDir(b.driveId, parent.id);
+      const commit = await wps.commitUpload(b.driveId, parent.id, upload_id);
+      // 注入缓存：WPS children 最终一致延迟（并发写时明显），HEAD 验证靠缓存立即可见
+      seedCache(wps, b.driveId, parent.id, commit ?? { id: upload_id, name, size: req.rawBody.length, type: "file" });
+      saveMtime(req, b, req.params[0]);
+      markUploaded(b, req.params[0]);
       res.status(200).set("ETag", `"${upload_id}"`).end();
     } catch (e) { next(e); }
   });
@@ -391,7 +437,16 @@ function invalidateDir(driveId, parentId) {
 }
 
 // 删除对象后清理变空的父目录（WPS 目录是真实实体，S3 语义下 purge/rm 会留空目录）
-// 从最深层父目录向上递归；有内容即停。下次 PUT 会自动重建目录。
+// 从最深层父目录向上递归；有内容即停。下次 PUT 会自动重建目录。// 上传成功后把新文件注入目录缓存（WPS children 最终一致延迟，HEAD 验证立即可见）
+async function seedCache(wps, driveId, parentId, file) {
+  if (!file?.name) return;
+  const map = await childrenMap(wps, driveId, parentId);
+  if (map) map.set(file.name, {
+    id: file.id, name: file.name, type: file.type ?? "file",
+    size: file.size ?? 0, mtime: file.mtime, hash: file.hash,
+  });
+}
+
 async function pruneEmptyFolders(wps, driveId, parentParts) {
   for (let i = parentParts.length; i > 0; i--) {
     const parts = parentParts.slice(0, i);
