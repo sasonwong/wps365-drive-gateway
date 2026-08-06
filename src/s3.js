@@ -1,6 +1,8 @@
 // S3 协议层：路由 + XML 响应
 import express from "express";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { parseAuth, verifySigV4, sigV4Error } from "./sigv4.js";
 
 function xmlEscape(s) {
@@ -11,8 +13,7 @@ function errXml(code, msg) {
   return `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${xmlEscape(msg)}</Message></Error>`;
 }
 
-export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmptyDirs = true }) {
-  const app = express();
+export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmptyDirs = true }) {  const app = express();
   app.disable("x-powered-by");
 
   // ── 请求预处理：收集 body + SigV4 验证 ─────────────────────────
@@ -157,10 +158,24 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
 
   // rclone 用 X-Amz-Meta-Mtime 做同步对比；网关内存记录（重启后需重跑一轮收敛）
   // ponytail: 内存 map，重启丢失；需要持久化时落盘 json
+  // rclone 用 X-Amz-Meta-Mtime 做同步对比；落盘持久化（重启不丢，增量 sync 不受影响）
   const mtimeMap = new Map(); // `${driveId}/${key}` → x-amz-meta-mtime 原样字符串（rclone 纳秒精度，浮点会丢位）
+  const mtimeFile = tokenFile ? path.join(path.dirname(tokenFile), "mtime.json") : null;
+  if (mtimeFile) {
+    try { Object.entries(JSON.parse(fs.readFileSync(mtimeFile, "utf8"))).forEach(([k, v]) => mtimeMap.set(k, v)); } catch { /* 首次运行 */ }
+  }
+  let mtimeSaveTimer;
+  const persistMtime = () => {
+    if (!mtimeFile) return;
+    clearTimeout(mtimeSaveTimer);
+    mtimeSaveTimer = setTimeout(() => {
+      fs.mkdirSync(path.dirname(mtimeFile), { recursive: true });
+      fs.writeFileSync(mtimeFile, JSON.stringify(Object.fromEntries(mtimeMap)));
+    }, 2000);
+  };
   const saveMtime = (req, b, key) => {
     const mt = req.headers["x-amz-meta-mtime"];
-    if (mt) mtimeMap.set(`${b.driveId}/${key}`, mt);
+    if (mt) { mtimeMap.set(`${b.driveId}/${key}`, mt); persistMtime(); }
   };
   const keyMtime = (b, key) => mtimeMap.get(`${b.driveId}/${key}`);
 
@@ -204,7 +219,7 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
         // 注入缓存（同 PUT：HEAD 验证不依赖 WPS list 延迟）
         seedCache(wps, b.driveId, parent.id, commit ?? { id: "", name: up.name, size: body.length, type: "file" });
         // mtime 只在 CreateMultipartUpload 请求里带（rclone multipart 语义），Complete 请求没有
-        if (up.mtime) mtimeMap.set(`${b.driveId}/${req.params[0]}`, up.mtime);
+        if (up.mtime) { mtimeMap.set(`${b.driveId}/${req.params[0]}`, up.mtime); persistMtime(); }
         markUploaded(b, req.params[0]);
         return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
