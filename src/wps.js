@@ -180,7 +180,7 @@ export class WpsClient {
       name,
       size: body.length,
       hashes: [{ type: "sha256", sum: sha256 }],
-      on_name_conflict: "rename",
+      on_name_conflict: "overwrite", // S3 PUT 覆盖语义（rename 会产生 (N) 孤儿，rclone 死循环）
     });
   }
 
@@ -205,7 +205,7 @@ export class WpsClient {
     return this.post(`/v7/drives/${driveId}/files/${parentId}/create_multipart_upload_task`, {
       name, size, mode: "sequential",
       hashes: [{ type: "sha256", sum: sha256Hex }],
-      on_name_conflict: "rename",
+      on_name_conflict: "overwrite", // 同上：S3 PUT 覆盖语义
     });
   }
 

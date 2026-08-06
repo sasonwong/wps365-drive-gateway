@@ -90,3 +90,18 @@ WPS 的"文件夹"是真实实体，S3 协议没有目录对象，两者差异�
 ## License
 
 MIT
+
+## rclone sync 实测（8.3GB / 3727 文件）
+
+**核心语义修正**（sync 反复重传的 3 个连环根因）：
+
+1. **`on_name_conflict: "overwrite"`**：S3 PUT 是覆盖语义。原用 `rename` 导致每次覆盖都变成新建 `(N)` 文件 → 原 key 永远不存在 → rclone 死循环重传 + 大量孤儿文件。已改 overwrite。
+2. **`X-Amz-Meta-Mtime` 字符串原样存取**：rclone 的 mtime 是纳秒精度（如 `1785540000.123456789`），JS `parseFloat` 会截断（19 位有效数字超双精度）→ 对比永远不一致。网关必须字符串原样保存、原样回传。
+3. **multipart 的 mtime 在 CreateMultipartUpload 请求里**（rclone 对 >200MB 文件走 multipart，Complete 请求不带 metadata）→ Create 时存入会话。
+
+**验证结果**（连续 10 轮 sync 实测）：
+- 首轮全量：3725/3727 成功（2 个点号开头文件被 WPS 拒绝，见下）
+- 收敛后增量：**0 传输**（秒级完成）
+- 孤儿文件（`(N)` 变体）：overwrite 后不再产生
+
+**已知限制**：WPS 云盘不支持**点号开头**的文件名（`.stignore`、`.DS_Store` 等），返回 400。同步此类目录时用 `--filter "- .*"` 排除，或接受这 2 个错误（`--ignore-errors`）。
