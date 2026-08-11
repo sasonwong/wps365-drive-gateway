@@ -54,13 +54,32 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
     try {
       const b = bucket(req.params.bucket);
       if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "The specified bucket does not exist"));
+      // ListMultipartUploads：上传会话只活在内存里（重启即失），统一返回空列表
+      if (req.query.uploads !== undefined) {
+        return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>${xmlEscape(b.name)}</Bucket>
+  <KeyMarker>${xmlEscape(req.query["key-marker"] ?? "")}</KeyMarker>
+  <UploadIdMarker>${xmlEscape(req.query["upload-id-marker"] ?? "")}</UploadIdMarker>
+  <MaxUploads>${Math.min(parseInt(req.query["max-uploads"] ?? "1000", 10) || 1000, 1000)}</MaxUploads>
+  <IsTruncated>false</IsTruncated>
+</ListMultipartUploadsResult>`);
+      }
+      // GetBucketLocation：bucket 是固定映射，无真实区域，回 us-east-1
+      if (req.query.location !== undefined) {
+        return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>`);
+      }
+      const isV2 = req.query["list-type"] === "2";
       const prefix = req.query.prefix ?? "";
       const delimiter = req.query.delimiter;
-      const contToken = req.query["continuation-token"] ?? "";
+      // V2 用 continuation-token；V1 用 marker（可能是网关上次发的 NextMarker token，也可能是普通 key）
+      const contToken = isV2 ? (req.query["continuation-token"] ?? "") : "";
+      const marker = isV2 ? "" : (req.query.marker ?? "");
       const maxKeys = Math.min(parseInt(req.query["max-keys"] ?? "1000", 10) || 1000, 5000);
 
       // 拉取目录树：prefix 按 "/" 逐级下钻，其余条目由网关按前缀过滤
-      const { items, nextToken } = await listTree(wps, b.driveId, prefix, delimiter, maxKeys, contToken);
+      const { items, nextToken } = await listTree(wps, b.driveId, prefix, delimiter, maxKeys, contToken, marker);
 
       const contents = items
         .filter((f) => f.key.startsWith(prefix) && !f.isCommonPrefix)
@@ -76,15 +95,22 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
         .map((f) => `<CommonPrefixes><Prefix>${xmlEscape(f.key)}</Prefix></CommonPrefixes>`).join("");
 
       const truncated = nextToken ? "true" : "false";
+      // V1/V2 分页字段：V2 用 ContinuationToken/NextContinuationToken + KeyCount；
+      // V1（s3cmd 等）用 Marker/NextMarker——NextMarker 复用内部 token，客户端原样传回即可续页
+      const pagination = isV2
+        ? `${req.query["continuation-token"] ? `<ContinuationToken>${xmlEscape(req.query["continuation-token"])}</ContinuationToken>` : ""}
+  <KeyCount>${items.length}</KeyCount>
+  ${nextToken ? `<NextContinuationToken>${xmlEscape(nextToken)}</NextContinuationToken>` : ""}`
+        : `<Marker>${xmlEscape(marker)}</Marker>
+  ${nextToken ? `<NextMarker>${xmlEscape(nextToken)}</NextMarker>` : ""}`;
       res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>${xmlEscape(b.name)}</Name>
   <Prefix>${xmlEscape(prefix)}</Prefix>
+  ${pagination}
   ${delimiter ? `<Delimiter>${xmlEscape(delimiter)}</Delimiter>` : ""}
-  <KeyCount>${items.length}</KeyCount>
   <MaxKeys>${maxKeys}</MaxKeys>
   <IsTruncated>${truncated}</IsTruncated>
-  ${nextToken ? `<NextContinuationToken>${xmlEscape(nextToken)}</NextContinuationToken>` : ""}
   ${contents}${commonPrefixes}
 </ListBucketResult>`);
     } catch (e) { next(e); }
@@ -149,12 +175,32 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
     Readable.fromWeb(upstream.body).pipe(res);
     } catch (e) { next(e); }
   };
+  // ListParts: GET /{bucket}/{key}?uploadId=...（rclone 断点续传 / aws s3api list-parts 调试）
+  app.get("/:bucket/*", async (req, res, next) => {
+    if (req.query.uploadId === undefined) return next();
+    const up = mpu.get(req.query.uploadId);
+    if (!up) return res.status(404).type("xml").send(errXml("NoSuchUpload", "The specified upload does not exist."));
+    const parts = [...up.chunks.entries()]
+      .map(([n, buf]) => `<Part><PartNumber>${n}</PartNumber><ETag>"${up.etags.get(n) ?? ""}"</ETag><Size>${buf.length}</Size></Part>`)
+      .join("");
+    res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>${xmlEscape(up.b.name)}</Bucket>
+  <Key>${xmlEscape(up.key)}</Key>
+  <UploadId>${xmlEscape(req.query.uploadId)}</UploadId>
+  <PartNumberMarker>0</PartNumberMarker>
+  <NextPartNumberMarker>0</NextPartNumberMarker>
+  <MaxParts>${Math.min(parseInt(req.query["max-parts"] ?? "1000", 10) || 1000, 1000)}</MaxParts>
+  <IsTruncated>false</IsTruncated>
+  ${parts}
+</ListPartsResult>`);
+  });
   app.get("/:bucket/*", handleGet);
   app.head("/:bucket/*", handleGet);
 
   // ── Multipart upload 状态（缓冲式：Complete 时统一建 WPS 任务）──
   // ponytail: 内存缓冲，单文件过大（>2GB）会吃紧；需要时改 spool 磁盘
-  const mpu = new Map(); // uploadId → { b, parts: Map<number,Buffer>, name, key }
+  const mpu = new Map(); // uploadId → { b, parts, name, key, chunks: Map<number,Buffer>, etags: Map<number,md5> }
 
   // rclone 用 X-Amz-Meta-Mtime 做同步对比；网关内存记录（重启后需重跑一轮收敛）
   // ponytail: 内存 map，重启丢失；需要持久化时落盘 json
@@ -194,7 +240,7 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
       const name = parts.pop();
       if (req.query.uploads !== undefined) { // Create
         const uploadId = crypto.randomUUID();
-        mpu.set(uploadId, { b, parts, name, chunks: new Map(), mtime: req.headers["x-amz-meta-mtime"] });
+        mpu.set(uploadId, { b, parts, name, key: req.params[0], chunks: new Map(), etags: new Map(), mtime: req.headers["x-amz-meta-mtime"] });
         return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Bucket>${xmlEscape(b.name)}</Bucket>
@@ -315,8 +361,11 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
       if (req.query.uploadId && req.query.partNumber) {
         const up = mpu.get(req.query.uploadId);
         if (!up) return res.status(404).type("xml").send(errXml("NoSuchUpload", "The specified upload does not exist."));
-        up.chunks.set(parseInt(req.query.partNumber, 10), Buffer.from(req.rawBody));
-        return res.status(200).set("ETag", `"${crypto.createHash("md5").update(req.rawBody).digest("hex")}"`).end();
+        const partNum = parseInt(req.query.partNumber, 10);
+        const md5 = crypto.createHash("md5").update(req.rawBody).digest("hex");
+        up.chunks.set(partNum, Buffer.from(req.rawBody));
+        up.etags.set(partNum, md5);
+        return res.status(200).set("ETag", `"${md5}"`).end();
       }
 
       // CopyObject: x-amz-copy-source=/srcbucket/srckey
@@ -516,12 +565,18 @@ async function ensureDirPath(wps, driveId, parts) {
 
 // 列举：迭代式 DFS + continuation-token 分页（S3 语义）
 // prefix 前缀过滤 + delimiter 分组；最多返回 maxKeys 条，截断时给 nextToken
-async function listTree(wps, driveId, prefix, delimiter, maxKeys, contToken) {
+async function listTree(wps, driveId, prefix, delimiter, maxKeys, contToken, marker = "") {
   const items = [];
   // 栈：待枚举的目录 { dirKey, wpsToken }；contToken 恢复时从栈继续
   let stack = [];
   if (contToken) {
     try { stack = JSON.parse(Buffer.from(contToken, "base64url").toString()); } catch { /* 非法 token 从头开始 */ }
+  }
+  // V1 marker：网关自己的 NextMarker（base64 token）→ 恢复栈；普通 key → 字典序跳过
+  let keyFilter = "";
+  if (stack.length === 0 && marker) {
+    try { stack = JSON.parse(Buffer.from(marker, "base64url").toString()); }
+    catch { keyFilter = marker; }
   }
   if (stack.length === 0) {
     const slash = prefix.lastIndexOf("/");
@@ -529,33 +584,41 @@ async function listTree(wps, driveId, prefix, delimiter, maxKeys, contToken) {
   }
 
   let truncated = false;
-  while (stack.length > 0 && items.length < maxKeys) {
+  while (stack.length > 0) {
     const cur = stack.pop();
     const parts = cur.dirKey ? cur.dirKey.split("/").filter(Boolean) : [];
     const base = await resolveNode(wps, driveId, parts);
     if (!base) continue;
     const d = await wps.children(driveId, base.id, cur.wpsToken);
-
-    for (const f of d.items ?? []) {
-      if (items.length >= maxKeys) { truncated = true; break; }
+    const arr = d.items ?? [];
+    // offset：续页时跳过本页已返回的条目（截断发生在 children 页中间时靠它续）
+    let idx = cur.offset ?? 0;
+    for (; idx < arr.length; idx++) {
+      if (items.length >= maxKeys) break;
+      const f = arr[idx];
       const name = f.name ?? "";
       const key = cur.dirKey + name;
       if (!key.startsWith(prefix)) continue;
+      if (keyFilter && key <= keyFilter) continue;
       if (f.type === "folder") {
         if (delimiter) {
           items.push({ key: key + "/", isCommonPrefix: true });
-        } else if (!truncated) {
+        } else {
           stack.push({ dirKey: key + "/", wpsToken: "" });
         }
       } else {
         items.push({ key, size: f.size, mtime: f.mtime, etag: f.hash?.sum, isCommonPrefix: false });
       }
     }
-    // 本目录还有下一页 → 放回栈（子目录已入栈，DFS 顺序略乱但正确）
-    if (!truncated && d.next_page_token) stack.push({ dirKey: cur.dirKey, wpsToken: d.next_page_token });
+    // 本目录未枚举完（截断或还有下一页）：把当前位置压回栈，保证续页不会重头再来
+    if (idx < arr.length) {
+      stack.push({ dirKey: cur.dirKey, wpsToken: cur.wpsToken, offset: idx });
+    } else if (d.next_page_token) {
+      stack.push({ dirKey: cur.dirKey, wpsToken: d.next_page_token });
+    }
+    if (items.length >= maxKeys) break;
   }
-  if (stack.length > 0) truncated = true;
-  const nextToken = truncated
+  const nextToken = stack.length > 0
     ? Buffer.from(JSON.stringify(stack.slice(0, 50))).toString("base64url")
     : "";
   return { items, nextToken };

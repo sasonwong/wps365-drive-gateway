@@ -79,13 +79,12 @@ X-Kso-Authorization: KSO-1 <accessKey>:<HMAC-SHA256>
 
 ## 6. 功能取舍（第一版）
 
-**实现**：ListBuckets / ListObjectsV2（prefix + delimiter + continuation-token）/ GetObject（流式转发）/ PutObject（流式上传）/ DeleteObject / HeadObject / KSO-1 签名 / token 自动续期 / 只读模式 / 多 S3 凭证。
+**实现**：ListBuckets / ListObjectsV2 + V1（prefix + delimiter + 分页）/ GetObject（流式转发 + Range）/ PutObject / DeleteObject / DeleteObjects（批量）/ HeadObject / CopyObject / Multipart 全流程（Create/UploadPart/Complete/Abort + ListParts/ListMultipartUploads）/ GetBucketLocation / KSO-1 签名 / token 自动续期 / 只读模式 / 多 S3 凭证。
 
 **不做（后续按需加）**：
-- Multipart upload（`CreateMultipartUpload` 等）——WPS 侧需确认分片 API 语义后再做
-- CopyObject、GetBucketLocation 等次要操作
 - ACL / 策略 / 版本控制 / 标签
-- 大目录分页的深度缓存——第一版逐级实时查询，路径 → ID 用 TTL 内存缓存
+- 任意 `x-amz-meta-*` 元数据（只保留 rclone 的 Mtime）；条件请求头（If-*）；`encoding-type=url`
+- 大目录分页的深度缓存——逐级实时查询，路径 → ID 用 TTL 内存缓存
 
 ## 7. WPS API 依赖清单
 

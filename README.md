@@ -4,7 +4,7 @@
 
 ## 特性
 
-- ✅ S3 兼容：`ListBuckets` / `ListObjectsV2` / `GetObject`(Range) / `PutObject` / `DeleteObject` / `HeadObject` / `CopyObject` / **Multipart Upload**
+- ✅ S3 兼容：`ListBuckets` / `ListObjectsV2` / `ListObjects`(V1) / `GetObject`(Range) / `PutObject` / `DeleteObject` / `HeadObject` / `CopyObject` / `GetBucketLocation` / **Multipart Upload**（Create/UploadPart/Complete/Abort + ListParts/ListMultipartUploads）
 - ✅ 个人盘 + 团队文档库（`/v7/doclibs`）
 - ✅ AWS Signature V4 鉴权（静态 AK/SK，标准 S3 SDK 零改造接入）
 - ✅ 支持 WPS 侧 **KSO-1 签名**（开发者后台「接口签名」开启时也能用）
