@@ -130,21 +130,28 @@ export class WpsClient {
       ...(this.cfg.kso1Sign ? this.kso1Headers(method, uri, rawBody) : {}),
       ...(rawBody ? { "Content-Type": "application/json" } : {}),
     };
-    const r = await fetch(this.cfg.apiBase + uri, {
-      method, headers, body: rawBody, ...opts,
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok || data.code !== 0) {
-      // token 过期/失效时用 refresh_token 重试一次
-      if (r.status === 401 || data.code === 400000003 || data.code === 401000001) {
-        await this.refresh();
-        return this.request(method, uri, body, opts);
+    // 限流（429000001，WPS 对 token 校验接口的频率限制，窗口秒级）短退避重试：1s/2s/4s
+    for (let attempt = 0; ; attempt++) {
+      const r = await fetch(this.cfg.apiBase + uri, { method, headers, body: rawBody, ...opts });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || data.code !== 0) {
+        // token 过期/失效时用 refresh_token 重试一次
+        if (r.status === 401 || data.code === 400000003 || data.code === 401000001) {
+          await this.refresh();
+          return this.request(method, uri, body, opts);
+        }
+        if (data.code === 429000001 || r.status === 429) {
+          if (attempt < 3) {
+            await new Promise((res) => setTimeout(res, 1000 * 2 ** attempt));
+            continue;
+          }
+        }
+        const err = new Error(`WPS ${method} ${uri}: ${r.status} ${data.msg ?? data.message ?? ""} (${data.code ?? ""})`);
+        err.code = data.code;
+        throw err;
       }
-      const err = new Error(`WPS ${method} ${uri}: ${r.status} ${data.msg ?? data.message ?? ""} (${data.code ?? ""})`);
-      err.code = data.code;
-      throw err;
+      return data.data;
     }
-    return data.data;
   }
 
   async get(uri)  { return this.request("GET", uri); }
