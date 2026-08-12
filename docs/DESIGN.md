@@ -83,7 +83,7 @@ X-Kso-Authorization: KSO-1 <accessKey>:<HMAC-SHA256>
 
 **不做（后续按需加）**：
 - ACL / 策略 / 版本控制 / 标签
-- 任意 `x-amz-meta-*` 元数据（只保留 rclone 的 Mtime）；条件请求头（If-*）；`encoding-type=url`
+- 任意 `x-amz-meta-*` 元数据；条件请求头（If-*）；`encoding-type=url`（rclone 增量对比用 `size_only = true`，见 README）
 - 大目录分页的深度缓存——逐级实时查询，路径 → ID 用 TTL 内存缓存
 
 ## 7. WPS API 依赖清单

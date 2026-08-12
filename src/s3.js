@@ -1,8 +1,6 @@
 // S3 协议层：路由 + XML 响应
 import express from "express";
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import { parseAuth, verifySigV4, sigV4Error } from "./sigv4.js";
 
 function xmlEscape(s) {
@@ -13,7 +11,7 @@ function errXml(code, msg) {
   return `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${xmlEscape(msg)}</Message></Error>`;
 }
 
-export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmptyDirs = true }) {  const app = express();
+export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = true }) {  const app = express();
   app.disable("x-powered-by");
 
   // ── 请求预处理：收集 body + SigV4 验证 ─────────────────────────
@@ -86,7 +84,7 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
         .map((f) => `<Contents>
   <Key>${xmlEscape(f.key)}</Key>
   <Size>${f.size ?? 0}</Size>
-  <LastModified>${new Date((parseFloat(keyMtime(b, f.key)) || f.mtime || 0) * 1000).toISOString()}</LastModified>
+  <LastModified>${new Date((f.mtime || 0) * 1000).toISOString()}</LastModified>
   <ETag>"${f.etag ?? ""}"</ETag>
   <StorageClass>STANDARD</StorageClass>
 </Contents>`).join("");
@@ -147,12 +145,10 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
       return res.status(404).type("xml").send(errXml("NoSuchKey", "The specified key does not exist."));
     }
     const meta = await wps.meta(b.driveId, file.id);
-    const mtime = parseFloat(keyMtime(b, req.params[0])) || meta.mtime || 0;
+    const mtime = meta.mtime || 0;
     if (req.method === "HEAD") {
-      // rclone 从 X-Amz-Meta-Mtime 读 modtime（纳秒精度，原样字符串），Last-Modified 只是 fallback
+      // WPS 原生 mtime（秒级）即 S3 Last-Modified；rclone 增量对比走 size_only，不依赖 mtime
       const headers = { "Content-Length": meta.size ?? 0, "ETag": `"${meta.hash?.sum ?? ""}"`, "Last-Modified": new Date(mtime * 1000).toUTCString(), "Content-Type": "application/octet-stream" };
-      const mt = keyMtime(b, req.params[0]);
-      if (mt) headers["X-Amz-Meta-Mtime"] = mt;
       res.set(headers);
       return res.end();
     }
@@ -165,7 +161,7 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
       return res.status(502).type("xml").send(errXml("InternalError", `download failed: ${upstream.status}`));
     }
     res.status(upstream.status);
-    const lmFallback = new Date((parseFloat(keyMtime(b, req.params[0])) || meta.mtime || 0) * 1000).toUTCString();
+    const lmFallback = new Date((meta.mtime || 0) * 1000).toUTCString();
     for (const h of ["content-range", "accept-ranges", "content-length", "etag", "last-modified", "content-type"]) {
       const v = upstream.headers.get(h);
       if (v) res.set(h, h === "last-modified" ? v : v);
@@ -202,29 +198,6 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
   // ponytail: 内存缓冲，单文件过大（>2GB）会吃紧；需要时改 spool 磁盘
   const mpu = new Map(); // uploadId → { b, parts, name, key, chunks: Map<number,Buffer>, etags: Map<number,md5> }
 
-  // rclone 用 X-Amz-Meta-Mtime 做同步对比；网关内存记录（重启后需重跑一轮收敛）
-  // ponytail: 内存 map，重启丢失；需要持久化时落盘 json
-  // rclone 用 X-Amz-Meta-Mtime 做同步对比；落盘持久化（重启不丢，增量 sync 不受影响）
-  const mtimeMap = new Map(); // `${driveId}/${key}` → x-amz-meta-mtime 原样字符串（rclone 纳秒精度，浮点会丢位）
-  const mtimeFile = tokenFile ? path.join(path.dirname(tokenFile), "mtime.json") : null;
-  if (mtimeFile) {
-    try { Object.entries(JSON.parse(fs.readFileSync(mtimeFile, "utf8"))).forEach(([k, v]) => mtimeMap.set(k, v)); } catch { /* 首次运行 */ }
-  }
-  let mtimeSaveTimer;
-  const persistMtime = () => {
-    if (!mtimeFile) return;
-    clearTimeout(mtimeSaveTimer);
-    mtimeSaveTimer = setTimeout(() => {
-      fs.mkdirSync(path.dirname(mtimeFile), { recursive: true });
-      fs.writeFileSync(mtimeFile, JSON.stringify(Object.fromEntries(mtimeMap)));
-    }, 2000);
-  };
-  const saveMtime = (req, b, key) => {
-    const mt = req.headers["x-amz-meta-mtime"];
-    if (mt) { mtimeMap.set(`${b.driveId}/${key}`, mt); persistMtime(); }
-  };
-  const keyMtime = (b, key) => mtimeMap.get(`${b.driveId}/${key}`);
-
   // 近期上传记录：HEAD 404 时延迟重查，消除 WPS children 最终一致窗口
   const recentUploads = new Map(); // `${driveId}/${key}` → ts
   const markUploaded = (b, key) => recentUploads.set(`${b.driveId}/${key}`, Date.now());
@@ -240,7 +213,7 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
       const name = parts.pop();
       if (req.query.uploads !== undefined) { // Create
         const uploadId = crypto.randomUUID();
-        mpu.set(uploadId, { b, parts, name, key: req.params[0], chunks: new Map(), etags: new Map(), mtime: req.headers["x-amz-meta-mtime"] });
+        mpu.set(uploadId, { b, parts, name, key: req.params[0], chunks: new Map(), etags: new Map() });
         return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Bucket>${xmlEscape(b.name)}</Bucket>
@@ -264,8 +237,6 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
         mpu.delete(req.query.uploadId);
         // 注入缓存（同 PUT：HEAD 验证不依赖 WPS list 延迟）
         seedCache(wps, b.driveId, parent.id, commit ?? { id: "", name: up.name, size: body.length, type: "file" });
-        // mtime 只在 CreateMultipartUpload 请求里带（rclone multipart 语义），Complete 请求没有
-        if (up.mtime) { mtimeMap.set(`${b.driveId}/${req.params[0]}`, up.mtime); persistMtime(); }
         markUploaded(b, req.params[0]);
         return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -385,10 +356,9 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
           await wps.renameFile(b.driveId, dstFileId, name);
         }
         invalidateDir(b.driveId, parent.id);
-        saveMtime(req, b, req.params[0]);
         markUploaded(b, req.params[0]);
         // S3 规范要求 CopyObjectResult XML 响应体（rclone 等客户端会反序列化）
-        const lm = new Date((keyMtime(sb, srcKey) ?? srcFile.mtime ?? Date.now() / 1000) * 1000).toISOString();
+        const lm = new Date((srcFile.mtime ?? Date.now() / 1000) * 1000).toISOString();
         return res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ETag>"${srcFile.hash?.sum ?? ""}"</ETag><LastModified>${lm}</LastModified></CopyObjectResult>`);
       }
@@ -418,7 +388,6 @@ export function createS3App({ wps, buckets, creds, readOnly, tokenFile, pruneEmp
       const commit = await wps.commitUpload(b.driveId, parent.id, upload_id);
       // 注入缓存：WPS children 最终一致延迟（并发写时明显），HEAD 验证靠缓存立即可见
       seedCache(wps, b.driveId, parent.id, commit ?? { id: upload_id, name, size: req.rawBody.length, type: "file" });
-      saveMtime(req, b, req.params[0]);
       markUploaded(b, req.params[0]);
       res.status(200).set("ETag", `"${upload_id}"`).end();
     } catch (e) { next(e); }
