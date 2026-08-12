@@ -37,7 +37,6 @@ const app = createS3App({
   buckets: cfg.buckets,
   creds: cfg.s3Credentials,
   readOnly: cfg.readOnly ?? false,
-  tokenFile,
   pruneEmptyDirs: cfg.pruneEmptyDirs ?? true,
 });
 

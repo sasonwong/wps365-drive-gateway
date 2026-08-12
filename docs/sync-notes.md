@@ -16,24 +16,21 @@
 - 修复：`requestUpload` / `multipartCreate` 的 `on_name_conflict: "overwrite"`
 - 附带修复：PUT `dir/`（directory marker）幂等——目录已存在不重复创建（createFolder 的 rename 会生成 `(1)` 目录）
 
-### 2. `X-Amz-Meta-Mtime` 浮点精度截断
+### 2. `X-Amz-Meta-Mtime` 浮点精度截断（机制已废弃）
 
-- 症状：小文件（<200MB）也反复重传
-- 机制：rclone 的 mtime 是纳秒精度字符串（`1785540000.123456789`，19 位有效数字），JS `parseFloat` 超双精度截断（变 `.1234567`）→ HEAD 回传的 mtime ≠ 原始 → 对比永远不一致
-- 修复：**字符串原样存取**、原样回传 `X-Amz-Meta-Mtime` 响应头（Last-Modified 只是 fallback，rclone 优先读 meta 头）
+- 历史：曾用 `X-Amz-Meta-Mtime` 回传纳秒精度 mtime（rclone 优先读它），踩过 JS `parseFloat` 双精度截断（19 位有效数字）导致对比永不相等 → 字符串原样存取修复
+- **已废弃**：WPS API 没有设置 mtime 的能力（`request_upload`/multipart 均无 modified_time 参数），mtime 表是第三份状态（路径 key、删除不清理、外部渠道修改后 rclone 看不到）。整个机制已删除，见下方现役策略
 
-### 3. multipart 的 mtime 盲区
+### 3. multipart 的 mtime 盲区（随机制一起废弃）
 
-- 症状：>200MB 文件（`--s3-upload-cutoff` 默认 200MB）持续重传
-- 机制：rclone 走 multipart 时 metadata（含 mtime）只在 **CreateMultipartUpload** 请求带，**Complete 请求不带** → Complete 分支读不到
-- 修复：Create 时把 `x-amz-meta-mtime` 存入 mpu 会话，Complete 时取出
+- 历史：rclone 走 multipart 时 metadata 只在 CreateMultipartUpload 带，Complete 不带 → Complete 分支读不到
+- 随 §2 机制删除而废弃
 
-## mtime 持久化
+## mtime 策略（现役）
 
-mtime 表是**内存 + 落盘**（`<tokenFile 同目录>/mtime.json`，debounce 2s 写盘，启动时加载）：
-
-- 网关重启后 mtime 记录仍在 → 增量 sync 不受影响
-- `mtime.json` 已 gitignore（含 key 路径，算隐私数据）
+- WPS 原生 `mtime`（秒级）= S3 `Last-Modified`，无任何自维护状态，外部渠道的修改天然可见
+- rclone 侧 `[wps]` 配置 **`size_only = true`**：增量 sync 按大小对比，不依赖 mtime（备份场景标准做法）
+- 代价：上传文件 mtime = 上传时刻（非源时间）；同大小内容修改不重传。restic append-only repo 不受影响（按内容哈希去重）
 
 ## 验证轮次
 
@@ -45,6 +42,8 @@ mtime 表是**内存 + 落盘**（`<tokenFile 同目录>/mtime.json`，debounce 
 | sync9（mtime 字符串+multipart 修复） | 全量成功，Deleted 0 |
 | sync10 | **0 传输** ✅ 收敛 |
 | 重启网关后 | mtime.json 加载，HEAD 原样回传 ✅ |
+
+> 上述 sync9/sync10/重启行是 `X-Amz-Meta-Mtime` 机制时期的验证；机制移除后（size_only 方案）增量 sync 按大小对比收敛，语义见「mtime 策略」
 
 ## 其他关联修复
 

@@ -42,6 +42,7 @@ provider = Other
 endpoint = http://127.0.0.1:9000
 access_key_id = gateway-admin
 secret_access_key = change-me
+size_only = true          # 增量对比按大小（WPS mtime 是秒级上传时刻，备份场景推荐）
 ```
 
 ## Docker 部署

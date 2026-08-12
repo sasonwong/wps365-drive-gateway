@@ -3,4 +3,3 @@ config.json
 tokens.json
 *.log
 data/
-mtime.json
