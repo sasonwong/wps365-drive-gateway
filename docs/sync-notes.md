@@ -29,7 +29,8 @@
 ## mtime 策略（现役）
 
 - WPS 原生 `mtime`（秒级）= S3 `Last-Modified`，无任何自维护状态，外部渠道的修改天然可见
-- rclone 侧 `[wps]` 配置 **`size_only = true`**：增量 sync 按大小对比，不依赖 mtime（备份场景标准做法）
+- rclone 同步加 **`--size-only`**：增量按大小对比，不依赖 mtime（备份场景标准做法）
+- 注意：`size_only = true` **写不进 rclone.conf**（1.71 实测静默忽略），必须命令行 flag 或环境变量 `RCLONE_SIZE_ONLY=true`
 - 代价：上传文件 mtime = 上传时刻（非源时间）；同大小内容修改不重传。restic append-only repo 不受影响（按内容哈希去重）
 
 ## 验证轮次
