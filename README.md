@@ -59,6 +59,21 @@ docker compose logs -f wps365-drive-gateway
 - `./data/tokens.json` 持久化登录态（refresh_token），重启不重新授权
 - 映射端口/限制监听地址按需改 `docker-compose.yml`
 
+## 本机常驻（systemd 用户服务）
+
+```bash
+# unit 里的 node 走 ~/.local/bin/node 软链，避免把特定 node 版本写进仓库
+mkdir -p ~/.local/bin && ln -sfn "$(command -v node)" ~/.local/bin/node
+ln -sfn "$PWD/deploy/wps365-drive-gateway.service" ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now wps365-drive-gateway
+```
+
+- 日志与首次授权链接：`journalctl --user -u wps365-drive-gateway -f`
+- 配置与登录态：仓库根的 `config.json` / `tokens.json`，不随 unit 走
+- 开机自启需要 `loginctl enable-linger $USER`
+- 升级 node 后重跑上面的 `ln -sfn "$(command -v node)" ~/.local/bin/node`
+
 ## 配置
 
 见 [docs/DESIGN.md §8](docs/DESIGN.md) 与 `config.example.json`。关键项：

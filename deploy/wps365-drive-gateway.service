@@ -1,0 +1,14 @@
+[Unit]
+Description=WPS365 Drive Gateway (S3-compatible endpoint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 用 ~/.local/bin/node（安装步骤里指向当前 node 的软链），避免把特定 node 版本写死进仓库
+ExecStart=%h/.local/bin/node %h/wps365-drive-gateway/src/index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
