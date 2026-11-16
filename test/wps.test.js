@@ -57,3 +57,18 @@ test("request() 非限流错误不重试，直接抛错", async () => {
     fs.rmSync(tokenFile);
   }
 });
+
+test("save() 原子写 token：内容完整、权限 600、不残留 .tmp", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wps-save-"));
+  const tokenFile = path.join(dir, "tokens.json");
+  const wps = new WpsClient({ clientId: "c", clientSecret: "s" }, tokenFile);
+  wps.accessToken = "a"; wps.refreshToken = "r"; wps.expiresAt = 123;
+
+  wps.save();
+
+  assert.deepEqual(JSON.parse(fs.readFileSync(tokenFile, "utf8")),
+    { access_token: "a", refresh_token: "r", expires_at: 123 });
+  assert.equal(fs.statSync(tokenFile).mode & 0o777, 0o600);
+  assert.equal(fs.existsSync(`${tokenFile}.tmp`), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
