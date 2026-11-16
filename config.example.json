@@ -27,5 +27,7 @@
     }
   ],
   "readOnly": false,
-  "pruneEmptyDirs": true
+  "pruneEmptyDirs": true,
+  "listConcurrency": 8,
+  "cacheTtlMs": 30000
 }

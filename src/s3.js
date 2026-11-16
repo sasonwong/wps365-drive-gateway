@@ -11,7 +11,10 @@ function errXml(code, msg) {
   return `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${xmlEscape(msg)}</Message></Error>`;
 }
 
-export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = true }) {  const app = express();
+export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = true, cacheTtlMs = 30_000, listConcurrency = 8 }) {
+  CACHE_TTL = cacheTtlMs;
+  LIST_CONCURRENCY = Math.max(1, listConcurrency);
+  const app = express();
   app.disable("x-powered-by");
 
   // ── 请求预处理：收集 body + SigV4 验证 ─────────────────────────
@@ -446,7 +449,44 @@ export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = tr
 // ── 工具：路径解析与目录树列举 ──────────────────────────────────
 // 路径 → 文件节点（逐级 children 查询，带 TTL 缓存）
 const dirCache = new Map(); // key: driveId/parentId → {name: {id, type, size, mtime, hash}, ts}
-const CACHE_TTL = 30_000;
+// 可调项：由 createS3App 注入（cacheTtlMs / listConcurrency）
+let CACHE_TTL = 30_000;
+let LIST_CONCURRENCY = 8;
+
+// 并发闸门：列举时装取多个子目录。WPS children 单次在百毫秒级，串行 256 个目录要数十秒；
+// 并发 8：同时给限流（429000001）留余量。
+let inflight = 0;
+const waiting = [];
+function limited(fn) {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      inflight++;
+      fn().then(resolve, reject).finally(() => {
+        inflight--;
+        waiting.shift()?.();
+      });
+    };
+    if (inflight < LIST_CONCURRENCY) run(); else waiting.push(run);
+  });
+}
+
+// 列举用的 children 缓存 + 预取去重：键含 token（分页各页独立缓存），
+// 命中 CACHE_TTL 内直接复用；写操作经 invalidateDir 立即失效。
+const listCache = new Map(); // `${driveId}/${parentId}/${token}` → {d, ts} | {p}
+function fetchChildren(wps, driveId, parentId, token = "") {
+  const k = `${driveId}/${parentId}/${token}`;
+  const hit = listCache.get(k);
+  if (hit?.d && Date.now() - hit.ts < CACHE_TTL) return Promise.resolve(hit.d);
+  if (hit?.p) return hit.p;
+  if (listCache.size > 2000) listCache.clear(); // 截断后未消费的残留
+  const p = limited(() => wps.children(driveId, parentId, token)).then((d) => {
+    listCache.set(k, { d, ts: Date.now() });
+    return d;
+  });
+  p.catch(() => listCache.delete(k)); // 失败不缓存
+  listCache.set(k, { p });
+  return p;
+}
 
 async function childrenMap(wps, driveId, parentId) {
   const ck = `${driveId}/${parentId}`;
@@ -467,6 +507,8 @@ async function childrenMap(wps, driveId, parentId) {
 // 写入操作后失效父目录缓存（PUT/DELETE/Copy/Complete 都会改变目录内容）
 function invalidateDir(driveId, parentId) {
   dirCache.delete(`${driveId}/${parentId}`);
+  const prefix = `${driveId}/${parentId}/`;
+  for (const k of listCache.keys()) if (k.startsWith(prefix)) listCache.delete(k);
 }
 
 // 删除对象后清理变空的父目录（WPS 目录是真实实体，S3 语义下 purge/rm 会留空目录）
@@ -552,13 +594,12 @@ async function listTree(wps, driveId, prefix, delimiter, maxKeys, contToken, mar
     stack.push({ dirKey: slash >= 0 ? prefix.slice(0, slash + 1) : "", wpsToken: "" });
   }
 
-  let truncated = false;
   while (stack.length > 0) {
     const cur = stack.pop();
-    const parts = cur.dirKey ? cur.dirKey.split("/").filter(Boolean) : [];
-    const base = await resolveNode(wps, driveId, parts);
+    // 栈里带 id 就不用再逐级解析；从 token 恢复的旧条目没有 id，回退到 resolveNode
+    const base = cur.id ? { id: cur.id } : await resolveNode(wps, driveId, cur.dirKey ? cur.dirKey.split("/").filter(Boolean) : []);
     if (!base) continue;
-    const d = await wps.children(driveId, base.id, cur.wpsToken);
+    const d = await fetchChildren(wps, driveId, base.id, cur.wpsToken);
     const arr = d.items ?? [];
     // offset：续页时跳过本页已返回的条目（截断发生在 children 页中间时靠它续）
     let idx = cur.offset ?? 0;
@@ -573,7 +614,9 @@ async function listTree(wps, driveId, prefix, delimiter, maxKeys, contToken, mar
         if (delimiter) {
           items.push({ key: key + "/", isCommonPrefix: true });
         } else {
-          stack.push({ dirKey: key + "/", wpsToken: "" });
+          // 入栈同时预取：256 个兄弟目录并行拉，弹栈时基本已就绪
+          stack.push({ dirKey: key + "/", wpsToken: "", id: f.id });
+          fetchChildren(wps, driveId, f.id);
         }
       } else {
         items.push({ key, size: f.size, mtime: f.mtime, etag: f.hash?.sum, isCommonPrefix: false });
@@ -581,9 +624,9 @@ async function listTree(wps, driveId, prefix, delimiter, maxKeys, contToken, mar
     }
     // 本目录未枚举完（截断或还有下一页）：把当前位置压回栈，保证续页不会重头再来
     if (idx < arr.length) {
-      stack.push({ dirKey: cur.dirKey, wpsToken: cur.wpsToken, offset: idx });
+      stack.push({ dirKey: cur.dirKey, wpsToken: cur.wpsToken, offset: idx, id: base.id });
     } else if (d.next_page_token) {
-      stack.push({ dirKey: cur.dirKey, wpsToken: d.next_page_token });
+      stack.push({ dirKey: cur.dirKey, wpsToken: d.next_page_token, id: base.id });
     }
     if (items.length >= maxKeys) break;
   }
