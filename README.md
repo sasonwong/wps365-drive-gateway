@@ -85,6 +85,8 @@ systemctl --user enable --now wps365-drive-gateway
 | `wps.kso1Sign` | 是否启用 KSO-1 请求签名（后台「接口签名」开着则必须 true） |
 | `buckets` | bucket 名 → WPS drive_id 映射（个人盘/团队文档库均可） |
 | `readOnly` | true 时拒绝写操作 |
+| `listConcurrency` | 递归列举时并发拉取子目录的数量，默认 8。调大可加速大仓库列举（如 rustic/restic 的 pack 列表），过高会撞 WPS 限流 |
+| `cacheTtlMs` | 目录列表缓存时长，默认 30000（30s）。网关自身的写操作会立即失效缓存，只有外部（网页端/客户端）改动要等 TTL 生效 |
 
 ## 安全说明
 
