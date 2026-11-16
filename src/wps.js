@@ -25,11 +25,15 @@ export class WpsClient {
 
   save() {
     fs.mkdirSync(path.dirname(this.tokenFile), { recursive: true });
-    fs.writeFileSync(this.tokenFile, JSON.stringify({
+    // 原子写：先写临时文件再 rename。直接覆盖时进程被杀会留下半截 JSON，
+    // load() 会静默忽略、退回设备码登录（常驻服务因此卡在等授权）。
+    const tmp = `${this.tokenFile}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({
       access_token: this.accessToken,
       refresh_token: this.refreshToken,
       expires_at: this.expiresAt,
     }, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, this.tokenFile);
   }
 
   // ── OAuth2 设备码流程（RFC 8628）──────────────────────────────
