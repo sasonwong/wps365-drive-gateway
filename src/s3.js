@@ -11,7 +11,7 @@ function errXml(code, msg) {
   return `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${xmlEscape(msg)}</Message></Error>`;
 }
 
-export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = true, cacheTtlMs = 30_000, listConcurrency = 8 }) {
+export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = true, cacheTtlMs = 30_000, listConcurrency = 16 }) {
   CACHE_TTL = cacheTtlMs;
   LIST_CONCURRENCY = Math.max(1, listConcurrency);
   const app = express();
@@ -451,10 +451,10 @@ export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = tr
 const dirCache = new Map(); // key: driveId/parentId → {name: {id, type, size, mtime, hash}, ts}
 // 可调项：由 createS3App 注入（cacheTtlMs / listConcurrency）
 let CACHE_TTL = 30_000;
-let LIST_CONCURRENCY = 8;
+let LIST_CONCURRENCY = 16;
 
 // 并发闸门：列举时装取多个子目录。WPS children 单次在百毫秒级，串行 256 个目录要数十秒；
-// 并发 8：同时给限流（429000001）留余量。
+// 并发 16：256 个目录在数秒内拉完，同时给限流（429000001）留余量。
 let inflight = 0;
 const waiting = [];
 function limited(fn) {

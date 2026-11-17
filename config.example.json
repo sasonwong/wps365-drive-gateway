@@ -28,6 +28,6 @@
   ],
   "readOnly": false,
   "pruneEmptyDirs": true,
-  "listConcurrency": 8,
+  "listConcurrency": 16,
   "cacheTtlMs": 30000
 }
