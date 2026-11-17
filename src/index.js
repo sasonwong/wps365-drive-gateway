@@ -39,7 +39,7 @@ const app = createS3App({
   readOnly: cfg.readOnly ?? false,
   pruneEmptyDirs: cfg.pruneEmptyDirs ?? true,
   cacheTtlMs: cfg.cacheTtlMs ?? 30_000,
-  listConcurrency: cfg.listConcurrency ?? 8,
+  listConcurrency: cfg.listConcurrency ?? 16,
 });
 
 app.listen(cfg.port ?? 9000, cfg.host ?? "127.0.0.1", () => {
