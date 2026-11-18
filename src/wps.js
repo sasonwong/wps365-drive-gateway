@@ -2,14 +2,20 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { Bucket, throttleBody } from "./throttle.js";
 
 export class WpsClient {
-  constructor(cfg, tokenFile) {
+  // rates: { upload, download, uploadConcurrency }（字节/秒，0=不限速）
+  constructor(cfg, tokenFile, rates = {}) {
     this.cfg = cfg;
     this.tokenFile = tokenFile;
     this.accessToken = null;
     this.refreshToken = null;
     this.expiresAt = 0;
+    this.rates = { upload: rates.upload ?? 0, download: rates.download ?? 0 };
+    // 桶按方向共享：并发 N 个上传合计仍不超过设定速率
+    this.uploadBucket = this.rates.upload ? new Bucket(this.rates.upload) : null;
+    this.downloadBucket = this.rates.download ? new Bucket(this.rates.download) : null;
     this.load();
   }
 
@@ -218,7 +224,11 @@ export class WpsClient {
     const headers = this.kso1Headers(storeRequest.method ?? "PUT", url.pathname + url.search, body, contentType);
     headers["Content-Length"] = body.length;
     headers["Authorization"] = `Bearer ${this.accessToken}`;
-    const up = await fetch(url, { method: storeRequest.method ?? "PUT", headers, body });
+    const out = throttleBody(body, this.uploadBucket);
+    const up = await fetch(url, {
+      method: storeRequest.method ?? "PUT", headers, body: out,
+      ...(out === body ? {} : { duplex: "half" }), // 流式 body 需要显式 half-duplex
+    });
     if (!up.ok) throw new Error(`store upload failed: ${up.status} ${(await up.text()).slice(0, 120)}`);
   }
   async commitUpload(driveId, parentId, uploadId) {
@@ -243,7 +253,11 @@ export class WpsClient {
     headers["Content-Length"] = data.length;
     headers["Content-MD5"] = crypto.createHash("md5").update(data).digest("base64");
     headers["Authorization"] = `Bearer ${this.accessToken}`;
-    const up = await fetch(url.origin + uri, { method: "PUT", headers, body: data });
+    const out = throttleBody(data, this.uploadBucket);
+    const up = await fetch(url.origin + uri, {
+      method: "PUT", headers, body: out,
+      ...(out === data ? {} : { duplex: "half" }),
+    });
     if (!up.ok) throw new Error(`multipart part ${partNumber}: ${up.status} ${(await up.text()).slice(0, 120)}`);
   }
 

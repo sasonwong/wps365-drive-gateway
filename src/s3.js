@@ -2,6 +2,7 @@
 import express from "express";
 import crypto from "node:crypto";
 import { parseAuth, verifySigV4, sigV4Error } from "./sigv4.js";
+import { throttleStream } from "./throttle.js";
 
 function xmlEscape(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -11,14 +12,19 @@ function errXml(code, msg) {
   return `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${xmlEscape(msg)}</Message></Error>`;
 }
 
-export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = true, cacheTtlMs = 30_000, listConcurrency = 16 }) {
+export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = true, cacheTtlMs = 30_000, listConcurrency = 16, uploadConcurrency = 2 }) {
   CACHE_TTL = cacheTtlMs;
   LIST_CONCURRENCY = Math.max(1, listConcurrency);
+  INGRESS_CONCURRENCY = Math.max(1, uploadConcurrency);
   const app = express();
   app.disable("x-powered-by");
 
   // ── 请求预处理：收集 body + SigV4 验证 ─────────────────────────
-  app.use((req, res, next) => {
+  // 写请求先过入口闸门：整个 body 会驻留内存（32 MiB 对象峰值约 100 MiB），
+  // 不限并发就会叠乘。闸门必须卡在「读 body 之前」，卡在 WPS 上传那一步没用。
+  app.use(async (req, res, next) => {
+    const gated = req.method === "PUT" || req.method === "POST";
+    if (gated) await acquireIngress();
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
@@ -29,6 +35,12 @@ export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = tr
       }
       next();
     });
+    if (gated) {
+      let released = false;
+      const release = () => { if (!released) { released = true; releaseIngress(); } };
+      res.on("finish", release);
+      res.on("close", release); // 客户端中断也要还名额
+    }
     req.on("error", () => res.status(400).end());
   });
 
@@ -171,7 +183,9 @@ export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = tr
     }
     if (!res.get("Last-Modified")) res.set("Last-Modified", lmFallback);
     const { Readable } = await import("node:stream");
-    Readable.fromWeb(upstream.body).pipe(res);
+    // 下载限速：节流下游写入，背压会一路传回 WPS 的读取
+    const down = Readable.fromWeb(upstream.body);
+    (wps.downloadBucket ? down.pipe(throttleStream(wps.downloadBucket)) : down).pipe(res);
     } catch (e) { next(e); }
   };
   // ListParts: GET /{bucket}/{key}?uploadId=...（rclone 断点续传 / aws s3api list-parts 调试）
@@ -452,6 +466,20 @@ const dirCache = new Map(); // key: driveId/parentId → {name: {id, type, size,
 // 可调项：由 createS3App 注入（cacheTtlMs / listConcurrency）
 let CACHE_TTL = 30_000;
 let LIST_CONCURRENCY = 16;
+let INGRESS_CONCURRENCY = 2;
+
+// 入口闸门：限制「同时在内存里的请求体」数量
+let ingressActive = 0;
+const ingressWaiting = [];
+function acquireIngress() {
+  if (ingressActive < INGRESS_CONCURRENCY) { ingressActive++; return Promise.resolve(); }
+  return new Promise((res) => ingressWaiting.push(res));
+}
+function releaseIngress() {
+  ingressActive--;
+  const next = ingressWaiting.shift();
+  if (next) next();
+}
 
 // 并发闸门：列举时装取多个子目录。WPS children 单次 ~112ms，串行 256 个目录要 28s；
 // 并发 16 实测 ~1.9s（256 目录，429 为 0），同时给限流（429000001）留余量。
