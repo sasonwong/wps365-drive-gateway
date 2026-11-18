@@ -29,5 +29,8 @@
   "readOnly": false,
   "pruneEmptyDirs": true,
   "listConcurrency": 16,
-  "cacheTtlMs": 30000
+  "cacheTtlMs": 30000,
+  "uploadRate": "2MiB",
+  "downloadRate": 0,
+  "uploadConcurrency": 2
 }

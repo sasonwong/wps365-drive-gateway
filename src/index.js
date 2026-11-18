@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WpsClient } from "./wps.js";
+import { parseRate } from "./throttle.js";
 import { createS3App } from "./s3.js";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -11,7 +12,12 @@ const configPath = process.env.WPS_GATEWAY_CONFIG ?? path.join(root, "config.jso
 const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
 const tokenFile = process.env.WPS_GATEWAY_TOKEN ?? path.join(root, "tokens.json");
 
-const wps = new WpsClient(cfg.wps, tokenFile);
+const rates = {
+  upload: parseRate(cfg.uploadRate),
+  download: parseRate(cfg.downloadRate),
+};
+const uploadConcurrency = cfg.uploadConcurrency ?? 2;
+const wps = new WpsClient(cfg.wps, tokenFile, rates);
 
 // 首次运行：设备码登录
 if (!wps.accessToken) {
@@ -40,10 +46,13 @@ const app = createS3App({
   pruneEmptyDirs: cfg.pruneEmptyDirs ?? true,
   cacheTtlMs: cfg.cacheTtlMs ?? 30_000,
   listConcurrency: cfg.listConcurrency ?? 16,
+  uploadConcurrency,
 });
 
 app.listen(cfg.port ?? 9000, cfg.host ?? "127.0.0.1", () => {
   console.log(`\nWPS365 Drive Gateway 已启动: http://${cfg.host ?? "127.0.0.1"}:${cfg.port ?? 9000}`);
   console.log(`S3 凭证: ${cfg.s3Credentials.map((c) => c.accessKey).join(", ")}`);
-  console.log(`Buckets: ${cfg.buckets.map((b) => b.name).join(", ")}${cfg.readOnly ? " (只读)" : ""}\n`);
+  console.log(`Buckets: ${cfg.buckets.map((b) => b.name).join(", ")}${cfg.readOnly ? " (只读)" : ""}`);
+  const fmt = (n) => (n ? `${(n / 1048576).toFixed(1)} MiB/s` : "不限");
+  console.log(`限速: 上传 ${fmt(rates.upload)}，下载 ${fmt(rates.download)}，写并发 ${uploadConcurrency}\n`);
 });
