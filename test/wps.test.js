@@ -72,3 +72,34 @@ test("save() 原子写 token：内容完整、权限 600、不残留 .tmp", () =
   assert.equal(fs.existsSync(`${tokenFile}.tmp`), false);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("refresh() 采信 tokens.json 里已被别的进程轮换的 refresh_token", async () => {
+  let gotRefresh = null;
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      gotRefresh = new URLSearchParams(body).get("refresh_token");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ access_token: "a2", refresh_token: "r2", expires_in: 3600 }));
+    });
+  });
+  await new Promise((r) => server.listen(0, r));
+  const port = server.address().port;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wps-adopt-"));
+  const tokenFile = path.join(dir, "tokens.json");
+  fs.writeFileSync(tokenFile, JSON.stringify({ access_token: "a1", refresh_token: "r1", expires_at: 0 }));
+  const wps = new WpsClient({ tokenUrl: `http://127.0.0.1:${port}/oauth2/token`, clientId: "c", clientSecret: "s", kso1Sign: false }, tokenFile);
+
+  // 模拟另一个进程做过一次 refresh 并轮换了 refresh_token
+  fs.writeFileSync(tokenFile, JSON.stringify({ access_token: "a1b", refresh_token: "r1-new", expires_at: 0 }));
+  try {
+    await wps.refresh();
+    assert.equal(gotRefresh, "r1-new");                                        // 用的是文件里的新值
+    assert.equal(wps.accessToken, "a2");                                       // 采纳服务端返回
+    assert.equal(JSON.parse(fs.readFileSync(tokenFile, "utf8")).refresh_token, "r2");
+  } finally {
+    server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

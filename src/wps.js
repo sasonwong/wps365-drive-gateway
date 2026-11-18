@@ -84,7 +84,22 @@ export class WpsClient {
     this.save();
   }
 
+  // WPS 每次 refresh 都会轮换 refresh_token，用旧值刷新必然 401。
+  // tokens.json 可能已被另一个进程（脚本、另一实例）刷新过：刷新前先重读文件采信新值。
+  adoptFromFile() {
+    if (!fs.existsSync(this.tokenFile)) return;
+    try {
+      const t = JSON.parse(fs.readFileSync(this.tokenFile, "utf8"));
+      if (t.refresh_token && t.refresh_token !== this.refreshToken) {
+        this.accessToken = t.access_token ?? this.accessToken;
+        this.refreshToken = t.refresh_token;
+        this.expiresAt = t.expires_at ?? this.expiresAt;
+      }
+    } catch { /* 文件损坏就按内存里的来 */ }
+  }
+
   async refresh() {
+    this.adoptFromFile();
     if (!this.refreshToken) throw new Error("无 refresh_token，需要重新设备码登录");
     const r = await fetch(this.cfg.tokenUrl, {
       method: "POST",
