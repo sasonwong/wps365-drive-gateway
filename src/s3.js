@@ -498,45 +498,45 @@ function limited(fn) {
   });
 }
 
-// 列举用的 children 缓存 + 预取去重：键含 token（分页各页独立缓存），
-// 命中 CACHE_TTL 内直接复用；写操作经 invalidateDir 立即失效。
-const listCache = new Map(); // `${driveId}/${parentId}/${token}` → {d, ts} | {p}
-function fetchChildren(wps, driveId, parentId, token = "") {
-  const k = `${driveId}/${parentId}/${token}`;
-  const hit = listCache.get(k);
-  if (hit?.d && Date.now() - hit.ts < CACHE_TTL) return Promise.resolve(hit.d);
-  if (hit?.p) return hit.p;
-  if (listCache.size > 2000) listCache.clear(); // 截断后未消费的残留
-  const p = limited(() => wps.children(driveId, parentId, token)).then((d) => {
-    listCache.set(k, { d, ts: Date.now() });
-    return d;
-  });
-  p.catch(() => listCache.delete(k)); // 失败不缓存
-  listCache.set(k, { p });
-  return p;
+// 预取：把一个目录整页拉完并写进 dirCache。弹栈时 childrenAll 直接命中缓存，
+// 于是 256 个兄弟目录是并发拉取的（并发数受 LIST_CONCURRENCY 限制），不是串行。
+function prefetchAll(wps, driveId, parentId) {
+  childrenAll(wps, driveId, parentId).catch(() => {}); // 失败留给后续 await 抛出
+}
+
+// 拉一个目录的**全部**条目（翻完所有页），按 name 排序后缓存。
+// 排序是为了让列举可以「按名字续页」：WPS 返回顺序不保证稳定，用下标续页会错位。
+const DIR_PAGE_CAP = 20; // 20 页 × 500 条，防止服务端一直返回 next_page_token 造成死循环
+
+async function childrenAll(wps, driveId, parentId) {
+  const ck = `${driveId}/${parentId}`;
+  const hit = dirCache.get(ck);
+  if (hit && Date.now() - hit.ts < CACHE_TTL && hit.arr) return hit.arr;
+  const items = [];
+  let token = "", pages = 0;
+  do {
+    const d = await limited(() => wps.children(driveId, parentId, token));
+    items.push(...(d.items ?? []));
+    token = d.next_page_token ?? "";
+    if (token) await new Promise((r) => setTimeout(r, 200));
+  } while (token && ++pages < DIR_PAGE_CAP);
+  items.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)); // 名字升序 = S3 的 key 序
+  const map = new Map(items.map((f) => [f.name, f]));
+  dirCache.set(ck, { map, arr: items, ts: Date.now() });
+  return items;
 }
 
 async function childrenMap(wps, driveId, parentId) {
   const ck = `${driveId}/${parentId}`;
   const hit = dirCache.get(ck);
-  if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.map;
-  let items = [], token = "";
-  do {
-    const d = await wps.children(driveId, parentId);
-    items = items.concat(d.items ?? []);
-    token = d.next_page_token ?? "";
-    if (token) await new Promise((r) => setTimeout(r, 200));
-  } while (token && items.length < 5000);
-  const map = new Map(items.map((f) => [f.name, f]));
-  dirCache.set(ck, { map, ts: Date.now() });
-  return map;
+  if (hit && Date.now() - hit.ts < CACHE_TTL && hit.map) return hit.map;
+  await childrenAll(wps, driveId, parentId);
+  return dirCache.get(ck)?.map ?? new Map();
 }
 
 // 写入操作后失效父目录缓存（PUT/DELETE/Copy/Complete 都会改变目录内容）
 function invalidateDir(driveId, parentId) {
   dirCache.delete(`${driveId}/${parentId}`);
-  const prefix = `${driveId}/${parentId}/`;
-  for (const k of listCache.keys()) if (k.startsWith(prefix)) listCache.delete(k);
 }
 
 // 删除对象后清理变空的父目录（WPS 目录是真实实体，S3 语义下 purge/rm 会留空目录）
@@ -544,10 +544,18 @@ function invalidateDir(driveId, parentId) {
 async function seedCache(wps, driveId, parentId, file) {
   if (!file?.name) return;
   const map = await childrenMap(wps, driveId, parentId);
-  if (map) map.set(file.name, {
+  if (!map) return;
+  const node = {
     id: file.id, name: file.name, type: file.type ?? "file",
     size: file.size ?? 0, mtime: file.mtime, hash: file.hash,
-  });
+  };
+  map.set(file.name, node);
+  // 目录的排序数组同样要补进去，否则紧接着的列举看不到这个文件
+  const entry = dirCache.get(`${driveId}/${parentId}`);
+  if (entry?.arr && !entry.arr.some((f) => f.name === file.name)) {
+    entry.arr.push(node);
+    entry.arr.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  }
 }
 
 async function pruneEmptyFolders(wps, driveId, parentParts) {
@@ -606,7 +614,9 @@ async function ensureDirPath(wps, driveId, parts) {
 // prefix 前缀过滤 + delimiter 分组；最多返回 maxKeys 条，截断时给 nextToken
 async function listTree(wps, driveId, prefix, delimiter, maxKeys, contToken, marker = "") {
   const items = [];
-  // 栈：待枚举的目录 { dirKey, wpsToken }；contToken 恢复时从栈继续
+  // 栈元素：{ dirKey, afterName, id }。afterName 是本目录里最后一条已返回的名字——
+  // 续页按「名字 > afterName」继续，而不是按数组下标：WPS 的 children 顺序会变，
+  // 备份/上传并发写入时下标会错位，导致重复或漏条目。
   let stack = [];
   if (contToken) {
     try { stack = JSON.parse(Buffer.from(contToken, "base64url").toString()); } catch { /* 非法 token 从头开始 */ }
@@ -619,7 +629,7 @@ async function listTree(wps, driveId, prefix, delimiter, maxKeys, contToken, mar
   }
   if (stack.length === 0) {
     const slash = prefix.lastIndexOf("/");
-    stack.push({ dirKey: slash >= 0 ? prefix.slice(0, slash + 1) : "", wpsToken: "" });
+    stack.push({ dirKey: slash >= 0 ? prefix.slice(0, slash + 1) : "", afterName: "" });
   }
 
   while (stack.length > 0) {
@@ -627,35 +637,37 @@ async function listTree(wps, driveId, prefix, delimiter, maxKeys, contToken, mar
     // 栈里带 id 就不用再逐级解析；从 token 恢复的旧条目没有 id，回退到 resolveNode
     const base = cur.id ? { id: cur.id } : await resolveNode(wps, driveId, cur.dirKey ? cur.dirKey.split("/").filter(Boolean) : []);
     if (!base) continue;
-    const d = await fetchChildren(wps, driveId, base.id, cur.wpsToken);
-    const arr = d.items ?? [];
-    // offset：续页时跳过本页已返回的条目（截断发生在 children 页中间时靠它续）
-    let idx = cur.offset ?? 0;
+    const arr = await childrenAll(wps, driveId, base.id);
+    const after = cur.afterName ?? "";
+    let idx = 0;
+    while (idx < arr.length && (arr[idx].name ?? "") <= after) idx++;
+    let lastEmitted = after;
+    const subdirs = [];
     for (; idx < arr.length; idx++) {
       if (items.length >= maxKeys) break;
       const f = arr[idx];
       const name = f.name ?? "";
       const key = cur.dirKey + name;
+      lastEmitted = name;
       if (!key.startsWith(prefix)) continue;
       if (keyFilter && key <= keyFilter) continue;
       if (f.type === "folder") {
         if (delimiter) {
           items.push({ key: key + "/", isCommonPrefix: true });
         } else {
-          // 入栈同时预取：256 个兄弟目录并行拉，弹栈时基本已就绪
-          stack.push({ dirKey: key + "/", wpsToken: "", id: f.id });
-          fetchChildren(wps, driveId, f.id);
+          subdirs.push({ dirKey: key + "/", afterName: "", id: f.id });
         }
       } else {
         items.push({ key, size: f.size, mtime: f.mtime, etag: f.hash?.sum, isCommonPrefix: false });
       }
     }
-    // 本目录未枚举完（截断或还有下一页）：把当前位置压回栈，保证续页不会重头再来
-    if (idx < arr.length) {
-      stack.push({ dirKey: cur.dirKey, wpsToken: cur.wpsToken, offset: idx, id: base.id });
-    } else if (d.next_page_token) {
-      stack.push({ dirKey: cur.dirKey, wpsToken: d.next_page_token, id: base.id });
+    // 逆序压栈，弹栈时就是名字升序（DFS 结果与字典序一致）
+    for (let i = subdirs.length - 1; i >= 0; i--) {
+      stack.push(subdirs[i]);
+      prefetchAll(wps, driveId, subdirs[i].id); // 预取整目录，弹栈时命中缓存
     }
+    // 本目录没列完：记下最后返回的名字，下次从这里继续
+    if (idx < arr.length) stack.push({ dirKey: cur.dirKey, afterName: lastEmitted, id: base.id });
     if (items.length >= maxKeys) break;
   }
   const nextToken = stack.length > 0
