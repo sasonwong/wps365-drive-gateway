@@ -3,3 +3,4 @@ config.json
 tokens.json
 *.log
 data/
+.worktrees/
