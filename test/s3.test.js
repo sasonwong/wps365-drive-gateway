@@ -113,3 +113,86 @@ test("ListParts 返回已上传分片；未知 uploadId → NoSuchUpload", async
   assert.equal(r.status, 404);
   assert.match(r.body, /NoSuchUpload/);
 });
+
+// ── 回归：分页必须按名字续页，不能用下标 ────────────────────────
+// 下面这套 fake WPS 支持真实分页（next_page_token）与运行时插入，用来复现两个 bug：
+//   1) childrenMap 从不把 page_token 传给 children → 目录 >1 页时解析不到后半部分
+//   2) listTree 用「本页数组下标」续页 → 目录内容变动时错位，重复/漏条目
+function pagedApp(initial, pageSize = 2, driveId = "d1") {
+  let items = [...initial].sort((a, b) => (a.name < b.name ? -1 : 1));
+  const wps = {
+    accessToken: "test",
+    children: async (_drive, _parent, token) => {
+      const start = token ? Number(token) : 0;
+      return { items: items.slice(start, start + pageSize), next_page_token: start + pageSize < items.length ? String(start + pageSize) : "" };
+    },
+  };
+  const app = createS3App({ wps, buckets: [{ name: "personal", driveId }], creds: [{ accessKey: "test", secretKey: "test-secret" }], pruneEmptyDirs: false });
+  const srv = app.listen(0);
+  const req = (path) => new Promise((resolve, reject) => {
+    const host = `127.0.0.1:${srv.address().port}`;
+    const signed = aws4.sign({ method: "GET", path, host, headers: { host }, body: "", service: "s3", region: "us-east-1" }, { accessKeyId: "test", secretAccessKey: "test-secret" });
+    http.request({ host: "127.0.0.1", port: srv.address().port, method: "GET", path, headers: signed.headers }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    }).on("error", reject).end();
+  });
+  return {
+    req,
+    insert: (name) => { items = [...items, { id: `id-${name}`, name, type: "file", size: 1, mtime: 1700000000 }].sort((a, b) => (a.name < b.name ? -1 : 1)); },
+    close: () => new Promise((r) => srv.close(r)),
+    names: () => items.map((i) => i.name),
+  };
+}
+
+const keysOf = (xml) => [...xml.matchAll(/<Key>([^<]+)<\/Key>/g)].map((m) => m[1]).sort();
+
+test("childrenMap 会翻完目录所有页（修复前只看第一页）", async () => {
+  const names = ["g1", "g2", "g3", "g4", "g5"];
+  const p = pagedApp(names.map((n, i) => ({ id: `id-${n}`, name: n, type: "file", size: i, mtime: 1700000000 })), 2, "d-g");
+  try {
+    const xml = await p.req("/personal?list-type=2&max-keys=100");
+    assert.deepEqual(keysOf(xml), names);                       // 5 条都在
+    // 直接解析最后一个文件（修复前 childrenMap 只有第一页，会 404）
+    const head = await p.req("/personal/g5");
+    assert.doesNotMatch(head, /NoSuchKey/);
+  } finally { await p.close(); }
+});
+
+test("listTree 按名字续页：目录在翻页期间插入新条目也不会重复/漏掉原有条目", async () => {
+  const original = ["h1", "h2", "h3", "h4", "h5"];
+  const p = pagedApp(original.map((n) => ({ id: `id-${n}`, name: n, type: "file", size: 1, mtime: 1700000000 })), 2, "d-h");
+  try {
+    const seen = [];
+    let token = "";
+    for (let i = 0; i < 10; i++) {
+      const xml = await p.req(`/personal?list-type=2&max-keys=2${token ? `&continuation-token=${encodeURIComponent(token)}` : ""}`);
+      seen.push(...keysOf(xml));
+      if (i === 0) p.insert("h0");        // 第一页之后插入一条排在最前的
+      if (!/<IsTruncated>true/.test(xml)) break;
+      token = xml.match(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/)?.[1];
+      assert.ok(token);
+    }
+    // 原有的 5 条一条不少、且没有重复（插入的 h0 排在游标之前，能与 S3 一样漏掉）
+    assert.deepEqual([...new Set(seen)].sort(), original.filter((n) => seen.includes(n)).sort());
+    for (const n of original) assert.ok(seen.includes(n), `漏了 ${n}`);
+    assert.equal(seen.length, new Set(seen).size, "出现重复条目");
+  } finally { await p.close(); }
+});
+
+test("listTree 静态目录：max-keys=1 逐页拉完，结果精确等于全集", async () => {
+  const names = ["k1", "k2", "k3", "k4"];
+  const p = pagedApp(names.map((n) => ({ id: `id-${n}`, name: n, type: "file", size: 1, mtime: 1700000000 })), 3, "d-k");
+  try {
+    const seen = [];
+    let token = "";
+    for (let i = 0; i < 10; i++) {
+      const xml = await p.req(`/personal?list-type=2&max-keys=1${token ? `&continuation-token=${encodeURIComponent(token)}` : ""}`);
+      seen.push(...keysOf(xml));
+      if (!/<IsTruncated>true/.test(xml)) break;
+      token = xml.match(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/)?.[1];
+    }
+    assert.deepEqual(seen, names);   // 顺序 + 完整性
+  } finally { await p.close(); }
+});
