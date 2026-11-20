@@ -234,3 +234,33 @@ test("下载中途上游断开：不产生未捕获的 promise 拒绝（网关�
     server.close();
   }
 });
+
+test("目录宽度大于 50 时续页不漏条目（曾因 token 截断栈丢掉整批子目录）", async () => {
+  const dirs = Array.from({ length: 60 }, (_, i) => `s${String(i).padStart(2, "0")}`);
+  const tree = { "0": dirs.map((d) => ({ id: `d-${d}`, name: d, type: "folder" })) };
+  for (const d of dirs) tree[`d-${d}`] = [1, 2].map((n) => ({ id: `${d}-${n}`, name: `f${n}`, type: "file", size: n, mtime: 1700000000 }));
+  const wps = { accessToken: "t", children: async (_dr, parent) => ({ items: tree[parent] ?? [], next_page_token: "" }) };
+  const app = createS3App({ wps, buckets: [{ name: "personal", driveId: "d-wide" }], creds: [{ accessKey: "test", secretKey: "test-secret" }], pruneEmptyDirs: false });
+  const srv = app.listen(0);
+  const get = (path) => new Promise((resolve, reject) => {
+    const host = `127.0.0.1:${srv.address().port}`;
+    const signed = aws4.sign({ method: "GET", path, host, headers: { host }, body: "", service: "s3", region: "us-east-1" }, { accessKeyId: "test", secretAccessKey: "test-secret" });
+    http.request({ host: "127.0.0.1", port: srv.address().port, method: "GET", path, headers: signed.headers }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    }).on("error", reject).end();
+  });
+  try {
+    const got = [];
+    let token = "";
+    for (let page = 0; page < 100; page++) {
+      const xml = await get(`/personal?list-type=2&max-keys=7${token ? `&continuation-token=${encodeURIComponent(token)}` : ""}`);
+      got.push(...keysOf(xml));
+      token = (xml.match(/<NextContinuationToken>([^<]+)</) || [])[1] ?? "";
+      if (!token) break;
+    }
+    assert.equal(got.length, 120, "总条目数不对");
+    assert.equal(new Set(got).size, 120, "出现重复条目");
+  } finally { await new Promise((r) => srv.close(r)); }
+});
