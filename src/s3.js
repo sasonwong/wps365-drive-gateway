@@ -182,10 +182,15 @@ export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = tr
       if (v) res.set(h, h === "last-modified" ? v : v);
     }
     if (!res.get("Last-Modified")) res.set("Last-Modified", lmFallback);
-    const { Readable } = await import("node:stream");
-    // 下载限速：节流下游写入，背压会一路传回 WPS 的读取
+    const { Readable, pipeline } = await import("node:stream");
+    // 下载限速：节流下游写入，背压会一路传回 WPS 的读取。
+    // 必须用 pipeline：客户端中途断开或 WPS 传一半 ECONNRESET 时，pipe 不会处理 source 的
+    // error，异常会以未捕获 promise 的形式把整个进程打挂（曾因此把进程打挂）。
     const down = Readable.fromWeb(upstream.body);
-    (wps.downloadBucket ? down.pipe(throttleStream(wps.downloadBucket)) : down).pipe(res);
+    const out = wps.downloadBucket ? down.pipe(throttleStream(wps.downloadBucket)) : down;
+    pipeline(out, res, (err) => {
+      if (err) console.warn("[gateway] 下载中断:", err.message);
+    });
     } catch (e) { next(e); }
   };
   // ListParts: GET /{bucket}/{key}?uploadId=...（rclone 断点续传 / aws s3api list-parts 调试）

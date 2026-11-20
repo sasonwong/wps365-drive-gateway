@@ -6,6 +6,11 @@ import { WpsClient } from "./wps.js";
 import { parseRate } from "./throttle.js";
 import { createS3App } from "./s3.js";
 
+// 网关是常驻代理：网络抖动的单次失败不该让整个服务退出（挂了就所有备份/客户端一起停）。
+// 兜底记录后继续跑；真正的 bug 会在日志里留下堆栈。
+process.on("unhandledRejection", (e) => console.error("[gateway] 未捕获的 promise 拒绝:", e?.stack ?? e));
+process.on("uncaughtException", (e) => console.error("[gateway] 未捕获异常:", e?.stack ?? e));
+
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const configPath = process.env.WPS_GATEWAY_CONFIG ?? path.join(root, "config.json");
 

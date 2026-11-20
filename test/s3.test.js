@@ -196,3 +196,41 @@ test("listTree 静态目录：max-keys=1 逐页拉完，结果精确等于全集
     assert.deepEqual(seen, names);   // 顺序 + 完整性
   } finally { await p.close(); }
 });
+
+test("下载中途上游断开：不产生未捕获的 promise 拒绝（网关曾因此整进程崩溃）", async () => {
+  const file = { id: "f1", name: "a.bin", type: "file", size: 10, mtime: 1700000000 };
+  const wps = {
+    accessToken: "t",
+    children: async () => ({ items: [file], next_page_token: "" }),
+    meta: async () => ({ size: 10, mtime: 1700000000 }),
+    downloadUrl: async () => "http://127.0.0.1:1/whatever",
+  };
+  const app = createS3App({ wps, buckets: [{ name: "personal", driveId: "d-dl" }], creds: [{ accessKey: "test", secretAccessKey: "test-secret" }], pruneEmptyDirs: false });
+  const server = app.listen(0);
+  const origFetch = globalThis.fetch;
+  // 模拟 WPS 传到一半 ECONNRESET
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(c) { c.enqueue(new Uint8Array([1, 2, 3])); c.error(new Error("ECONNRESET")); },
+  }));
+  const rejections = [];
+  const onRej = (e) => rejections.push(e);
+  process.on("unhandledRejection", onRej);
+  try {
+    const host = `127.0.0.1:${server.address().port}`;
+    const path = "/personal/a.bin";
+    const signed = aws4.sign({ method: "GET", path, host, headers: { host }, body: "", service: "s3", region: "us-east-1" }, { accessKeyId: "test", secretAccessKey: "test-secret" });
+    await new Promise((resolve) => {
+      const r = http.request({ host: "127.0.0.1", port: server.address().port, method: "GET", path, headers: signed.headers }, (res) => {
+        res.on("data", () => {}); res.on("end", resolve); res.on("error", resolve);
+      });
+      r.on("error", resolve);
+      r.end();
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.deepEqual(rejections, [], "出现了未处理的 promise 拒绝");
+  } finally {
+    process.off("unhandledRejection", onRej);
+    globalThis.fetch = origFetch;
+    server.close();
+  }
+});
