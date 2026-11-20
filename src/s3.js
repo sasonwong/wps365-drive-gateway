@@ -619,64 +619,53 @@ async function ensureDirPath(wps, driveId, parts) {
 // prefix 前缀过滤 + delimiter 分组；最多返回 maxKeys 条，截断时给 nextToken
 async function listTree(wps, driveId, prefix, delimiter, maxKeys, contToken, marker = "") {
   const items = [];
-  // 栈元素：{ dirKey, afterName, id }。afterName 是本目录里最后一条已返回的名字——
-  // 续页按「名字 > afterName」继续，而不是按数组下标：WPS 的 children 顺序会变，
-  // 备份/上传并发写入时下标会错位，导致重复或漏条目。
-  let stack = [];
+  // 续页只记「上一条返回的 key」，下次重新 DFS 跳过 <= 它的条目。
+  // 不能序列化待遍历的栈：data/ 下面有 256 个 shard 目录，栈宽就 256 项，
+  // 序列化后受 URL 长度限制只能截断，而截断就是丢目录（实测 9405 个对象只列出 2906 个）。
+  let lastKey = "";
+  if (marker) { // V1 marker：可能是我们自己的 NextMarker（base64 JSON），也可能是客户端给的裸 key
+    try { lastKey = JSON.parse(Buffer.from(marker, "base64url").toString()).k ?? ""; } catch { lastKey = marker; }
+  }
   if (contToken) {
-    try { stack = JSON.parse(Buffer.from(contToken, "base64url").toString()); } catch { /* 非法 token 从头开始 */ }
+    try { lastKey = JSON.parse(Buffer.from(contToken, "base64url").toString()).k ?? ""; } catch { lastKey = ""; }
   }
-  // V1 marker：网关自己的 NextMarker（base64 token）→ 恢复栈；普通 key → 字典序跳过
-  let keyFilter = "";
-  if (stack.length === 0 && marker) {
-    try { stack = JSON.parse(Buffer.from(marker, "base64url").toString()); }
-    catch { keyFilter = marker; }
-  }
-  if (stack.length === 0) {
-    const slash = prefix.lastIndexOf("/");
-    stack.push({ dirKey: slash >= 0 ? prefix.slice(0, slash + 1) : "", afterName: "" });
-  }
-
-  while (stack.length > 0) {
+  const slash = prefix.lastIndexOf("/");
+  const startDirKey = slash >= 0 ? prefix.slice(0, slash + 1) : "";
+  const base = await resolveNode(wps, driveId, startDirKey ? startDirKey.split("/").filter(Boolean) : []);
+  if (!base) return { items, nextToken: "" };
+  const stack = [{ dirKey: startDirKey, id: base.id }];
+  while (stack.length > 0 && items.length < maxKeys) {
     const cur = stack.pop();
-    // 栈里带 id 就不用再逐级解析；从 token 恢复的旧条目没有 id，回退到 resolveNode
-    const base = cur.id ? { id: cur.id } : await resolveNode(wps, driveId, cur.dirKey ? cur.dirKey.split("/").filter(Boolean) : []);
-    if (!base) continue;
-    const arr = await childrenAll(wps, driveId, base.id);
-    const after = cur.afterName ?? "";
-    let idx = 0;
-    while (idx < arr.length && (arr[idx].name ?? "") <= after) idx++;
-    let lastEmitted = after;
+    const arr = await childrenAll(wps, driveId, cur.id);
     const subdirs = [];
-    for (; idx < arr.length; idx++) {
+    for (const f of arr) {
       if (items.length >= maxKeys) break;
-      const f = arr[idx];
       const name = f.name ?? "";
       const key = cur.dirKey + name;
-      lastEmitted = name;
-      if (!key.startsWith(prefix)) continue;
-      if (keyFilter && key <= keyFilter) continue;
       if (f.type === "folder") {
         if (delimiter) {
+          if (key + "/" <= lastKey) continue;
+          if (!(key + "/").startsWith(prefix)) continue;
           items.push({ key: key + "/", isCommonPrefix: true });
+          lastKey = key + "/";
         } else {
-          subdirs.push({ dirKey: key + "/", afterName: "", id: f.id });
+          // 目录不占返回项，但子树里的 key 可能都 <= lastKey，仍在 DFS 里天然跳过
+          subdirs.push({ dirKey: key + "/", id: f.id });
         }
-      } else {
-        items.push({ key, size: f.size, mtime: f.mtime, etag: f.hash?.sum, isCommonPrefix: false });
+        continue;
       }
+      if (key <= lastKey) continue;
+      if (!key.startsWith(prefix)) continue;
+      items.push({ key, size: f.size, mtime: f.mtime, etag: f.hash?.sum, isCommonPrefix: false });
+      lastKey = key;
     }
     // 逆序压栈，弹栈时就是名字升序（DFS 结果与字典序一致）
     for (let i = subdirs.length - 1; i >= 0; i--) {
       stack.push(subdirs[i]);
       prefetchAll(wps, driveId, subdirs[i].id); // 预取整目录，弹栈时命中缓存
     }
-    // 本目录没列完：记下最后返回的名字，下次从这里继续
-    if (idx < arr.length) stack.push({ dirKey: cur.dirKey, afterName: lastEmitted, id: base.id });
-    if (items.length >= maxKeys) break;
   }
-  const nextToken = stack.length > 0
-    ? Buffer.from(JSON.stringify(stack.slice(0, 50))).toString("base64url")
-    : "";
+  const more = items.length >= maxKeys;
+  const nextToken = more ? Buffer.from(JSON.stringify({ k: lastKey })).toString("base64url") : "";
   return { items, nextToken };
 }
