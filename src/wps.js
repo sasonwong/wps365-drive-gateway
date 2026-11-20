@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { Bucket, throttleBody } from "./throttle.js";
+import { Bucket, throttleBody, throttleStream } from "./throttle.js";
 
 export class WpsClient {
   // rates: { upload, download, uploadConcurrency }（字节/秒，0=不限速）
@@ -131,11 +131,11 @@ export class WpsClient {
   // ── KSO-1 签名（kso 域接口；上传实体文件无论开关如何都要求）──
   // signature = HMAC-SHA256(secretKey, "KSO-1" + Method + RequestURI + ContentType + KsoDate + sha256(body))
   // 空 body 时 sha256 部分为空字符串（官方 Python 示例语义），非空才计算哈希
-  kso1Headers(method, uri, body, contentType = "application/json") {
+  kso1Headers(method, uri, body, contentType = "application/json", bodySha256 = null) {
     const date = new Date().toUTCString();
-    const sha256 = body && body.length > 0
+    const sha256 = bodySha256 ?? (body && body.length > 0
       ? crypto.createHash("sha256").update(body).digest("hex")
-      : "";
+      : "");
     const mac = crypto.createHmac("sha256", this.cfg.clientSecret)
       .update(`KSO-1${method}${uri}${contentType}${date}${sha256}`)
       .digest("hex");
@@ -208,9 +208,14 @@ export class WpsClient {
   // 公网必传 hashes（sha256 至少一种）
   async requestUpload(driveId, parentId, name, body) {
     const sha256 = crypto.createHash("sha256").update(body).digest("hex");
+    return this.requestUploadHashed(driveId, parentId, name, body.length, sha256);
+  }
+
+  // body 已在别处落盘/算过哈希时用这个：避免把大文件读进内存
+  requestUploadHashed(driveId, parentId, name, size, sha256) {
     return this.post(`/v7/drives/${driveId}/files/${parentId}/request_upload`, {
       name,
-      size: body.length,
+      size,
       hashes: [{ type: "sha256", sum: sha256 }],
       on_name_conflict: "overwrite", // S3 PUT 覆盖语义（rename 会产生 (N) 孤儿，rclone 死循环）
     });
@@ -233,6 +238,25 @@ export class WpsClient {
   }
   async commitUpload(driveId, parentId, uploadId) {
     return this.post(`/v7/drives/${driveId}/files/${parentId}/commit_upload`, { upload_id: uploadId });
+  }
+
+  // 从磁盘文件直传（restic pack 可达 128MB，不能整块进内存）；哈希已在落盘时算好
+  async uploadStoreHashed(storeRequest, filePath, size, sha256) {
+    const url = new URL(storeRequest.url);
+    const contentType = "application/octet-stream";
+    const headers = this.kso1Headers(storeRequest.method ?? "PUT", url.pathname + url.search, null, contentType, sha256);
+    headers["Content-Length"] = String(size);
+    headers["Authorization"] = `Bearer ${this.accessToken}`;
+    const src = fs.createReadStream(filePath);
+    const body = this.uploadBucket ? src.pipe(throttleStream(this.uploadBucket)) : src;
+    let up;
+    try {
+      up = await fetch(url, { method: storeRequest.method ?? "PUT", headers, body, duplex: "half" });
+      if (!up.ok) throw new Error(`store upload failed: ${up.status} ${(await up.text()).slice(0, 120)}`);
+      await up.arrayBuffer(); // 排空响应
+    } finally {
+      src.destroy();
+    }
   }
 
   // ── 分块上传（WPS 固定块大小，服务端下发 part_size）────────────

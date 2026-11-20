@@ -2,9 +2,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import express from "express";
 import { WpsClient } from "./wps.js";
 import { parseRate } from "./throttle.js";
 import { createS3App } from "./s3.js";
+import { createRestApp } from "./rest.js";
 
 // 网关是常驻代理：网络抖动的单次失败不该让整个服务退出（挂了就所有备份/客户端一起停）。
 // 兜底记录后继续跑；真正的 bug 会在日志里留下堆栈。
@@ -43,7 +45,16 @@ try {
   }
 } catch { /* 非致命 */ }
 
-const app = createS3App({
+const app = express();
+// REST 挂在 S3 之前：S3 的中间件会把整个请求体读进内存，restic 的 pack 不能走那条路
+app.use("/rest", createRestApp({
+  wps,
+  buckets: cfg.buckets,
+  creds: cfg.s3Credentials,
+  readOnly: cfg.readOnly ?? false,
+  uploadConcurrency,
+}));
+app.use(createS3App({
   wps,
   buckets: cfg.buckets,
   creds: cfg.s3Credentials,
@@ -52,12 +63,13 @@ const app = createS3App({
   cacheTtlMs: cfg.cacheTtlMs ?? 30_000,
   listConcurrency: cfg.listConcurrency ?? 16,
   uploadConcurrency,
-});
+}));
 
 app.listen(cfg.port ?? 9000, cfg.host ?? "127.0.0.1", () => {
   console.log(`\nWPS365 Drive Gateway 已启动: http://${cfg.host ?? "127.0.0.1"}:${cfg.port ?? 9000}`);
   console.log(`S3 凭证: ${cfg.s3Credentials.map((c) => c.accessKey).join(", ")}`);
   console.log(`Buckets: ${cfg.buckets.map((b) => b.name).join(", ")}${cfg.readOnly ? " (只读)" : ""}`);
+  console.log(`restic REST: rest:http://<user>:<pass>@${cfg.host ?? "127.0.0.1"}:${cfg.port ?? 9000}/rest/<bucket>/<repo 路径>/`);
   const fmt = (n) => (n ? `${(n / 1048576).toFixed(1)} MiB/s` : "不限");
   console.log(`限速: 上传 ${fmt(rates.upload)}，下载 ${fmt(rates.download)}，写并发 ${uploadConcurrency}\n`);
 });

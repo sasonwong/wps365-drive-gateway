@@ -11,6 +11,7 @@
 - ✅ delegated token 自动续期（refresh_token 长期有效，首次授权后无需人工干预）
 - ✅ 删除进回收站、只读模式、多凭证
 - ✅ 空目录自动清理（`pruneEmptyDirs` 可关）+ S3 directory marker（PUT `dir/` 建文件夹）
+- ✅ **restic / rustic 的 REST backend**（rest-server 兼容子集），备份不需要 rclone 中转
 - ✅ 纯 Node.js（≥20），仅依赖 `express` + `aws4`
 
 ## 快速开始
@@ -46,6 +47,34 @@ secret_access_key = change-me
 # 同步时加 --size-only：增量对比按大小（WPS mtime 是秒级上传时刻，备份场景推荐）
 # 注意：size_only 不支持写在 rclone.conf 里（实测静默忽略），必须用命令行 flag 或 RCLONE_SIZE_ONLY=true
 ```
+
+## restic / rustic（REST 端点）
+
+网关同时实现了 restic 的 REST backend 协议，restic / rustic 可以直接备份，
+不需要 `rclone serve` 再套一层：
+
+```bash
+# 仓库路径 = /rest/<bucket>/<仓库目录>/，目录不存在时 init 自动创建
+rustic -r rest:http://gateway-admin:change-me@127.0.0.1:9000/rest/personal/backups/restic/ init
+rustic -r rest:http://gateway-admin:change-me@127.0.0.1:9000/rest/personal/backups/restic/ backup /data
+
+restic -r rest:http://gateway-admin:change-me@127.0.0.1:9000/rest/personal/backups/restic/ init
+restic -r rest:http://gateway-admin:change-me@127.0.0.1:9000/rest/personal/backups/restic/ backup /data
+```
+
+- 认证：Basic，用户名/密码复用 `s3Credentials` 的 accessKey/secretKey
+- `bucket` 就是 S3 的 bucket 映射（个人盘 / 团队文档库都可）
+- 仓库是云盘里的一个普通目录（`config` / `data` / `index` / `keys` / `locks` / `snapshots`），可在 WPS 网页端看到
+- `readOnly: true` 时拒绝写入，只允许删 `locks`（`restic unlock` 可用；读操作加 `--no-lock`）
+- REST 协议不使用 mtime，restic 自己保存时间戳，所以无需 `--size-only` 之类的开关
+
+协议要点（改动时别踩）：
+
+- 列举必须返回 `application/vnd.x.restic.rest.v2`，**不能带 charset**，否则客户端按 v1 解析
+- 已存在的对象 `POST` 返回 `403`；不存在的对象 `DELETE` 返回 `200`（幂等）
+- `GET` 的 `Range` 原样透传给 WPS 直链；`HEAD` 必须带准确的 `Content-Length`
+- 上传先落临时文件并算 sha256（对象名就是 sha256），再走 WPS 三段式上传；pack 不进内存
+  （临时目录用 `os.tmpdir()`，`TMPDIR` 可改）
 
 ## Docker 部署
 
