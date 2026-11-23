@@ -33,5 +33,6 @@
   "uploadRate": "2MiB",
   "downloadRate": 0,
   "uploadConcurrency": 2,
-  "appendOnlyPaths": []
+  "appendOnlyPaths": [],
+  "autoBuckets": false
 }

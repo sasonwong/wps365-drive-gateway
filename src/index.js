@@ -7,6 +7,7 @@ import { WpsClient } from "./wps.js";
 import { parseRate } from "./throttle.js";
 import { createS3App } from "./s3.js";
 import { createRestApp } from "./rest.js";
+import { mergeBuckets, missingBuckets } from "./buckets.js";
 
 // 网关是常驻代理：网络抖动的单次失败不该让整个服务退出（挂了就所有备份/客户端一起停）。
 // 兜底记录后继续跑；真正的 bug 会在日志里留下堆栈。
@@ -33,15 +34,21 @@ if (!wps.accessToken) {
   try { await wps.ensureToken(); } catch (e) { console.warn("token 刷新失败，尝试重新登录:", e.message); await wps.login(cfg.wps.scopes); }
 }
 
-// 校验 bucket 映射：列出可用盘，提示缺失的 driveId
+// 发现盘：校验配置、按需自动注册未配置的盘（autoBuckets）
+let buckets = cfg.buckets;
 try {
   const [drives, doclibs] = await Promise.all([wps.listDrives().catch(() => null), wps.listDoclibs().catch(() => null)]);
-  const known = new Set([
-    ...(drives?.items ?? []).map((d) => d.id),
-    ...(doclibs?.items ?? []).map((d) => d.drive?.id),
-  ]);
-  for (const b of cfg.buckets) {
-    if (!known.has(b.driveId)) console.warn(`[config] bucket "${b.name}" 的 driveId ${b.driveId} 不在可访问列表中，请检查`);
+  const found = {
+    drives: (drives?.items ?? []).map((d) => ({ id: d.id, name: d.name })),
+    doclibs: (doclibs?.items ?? []).map((d) => ({ id: (d.drive ?? d).id, name: (d.drive ?? d).name })),
+  };
+  for (const b of missingBuckets(cfg.buckets, found)) {
+    console.warn(`[config] bucket "${b.name}" 的 driveId ${b.driveId} 不在可访问列表中，请检查`);
+  }
+  const merged = mergeBuckets(cfg.buckets, found, cfg.autoBuckets ?? false);
+  buckets = merged.buckets;
+  if (merged.added.length) {
+    console.log(`[config] autoBuckets: 发现 ${found.drives.length + found.doclibs.length} 个盘，自动注册 ${merged.added.length} 个未配置的：${merged.added.map((b) => b.name).join(", ")}`);
   }
 } catch { /* 非致命 */ }
 
@@ -49,7 +56,7 @@ const app = express();
 // REST 挂在 S3 之前：S3 的中间件会把整个请求体读进内存，restic 的 pack 不能走那条路
 app.use("/rest", createRestApp({
   wps,
-  buckets: cfg.buckets,
+  buckets,
   creds: cfg.s3Credentials,
   readOnly: cfg.readOnly ?? false,
   appendOnlyPaths: cfg.appendOnlyPaths ?? [],
@@ -57,7 +64,7 @@ app.use("/rest", createRestApp({
 }));
 app.use(createS3App({
   wps,
-  buckets: cfg.buckets,
+  buckets,
   creds: cfg.s3Credentials,
   readOnly: cfg.readOnly ?? false,
   appendOnlyPaths: cfg.appendOnlyPaths ?? [],
@@ -70,7 +77,7 @@ app.use(createS3App({
 app.listen(cfg.port ?? 9000, cfg.host ?? "127.0.0.1", () => {
   console.log(`\nWPS365 Drive Gateway 已启动: http://${cfg.host ?? "127.0.0.1"}:${cfg.port ?? 9000}`);
   console.log(`S3 凭证: ${cfg.s3Credentials.map((c) => c.accessKey).join(", ")}`);
-  console.log(`Buckets: ${cfg.buckets.map((b) => b.name).join(", ")}${cfg.readOnly ? " (只读)" : ""}`);
+  console.log(`Buckets: ${buckets.map((b) => b.name).join(", ")}${cfg.readOnly ? " (只读)" : ""}`);
   console.log(`restic REST: rest:http://<user>:<pass>@${cfg.host ?? "127.0.0.1"}:${cfg.port ?? 9000}/rest/<bucket>/<repo 路径>/`);
   const fmt = (n) => (n ? `${(n / 1048576).toFixed(1)} MiB/s` : "不限");
   console.log(`限速: 上传 ${fmt(rates.upload)}，下载 ${fmt(rates.download)}，写并发 ${uploadConcurrency}\n`);
