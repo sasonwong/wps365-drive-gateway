@@ -16,6 +16,7 @@ const V1 = "application/vnd.x.restic.rest.v1";
 const V2 = "application/vnd.x.restic.rest.v2";
 const LIST_TTL = 60_000;    // 目录内容缓存：只用于外部改动，本进程写操作会即时更新
 const MAX_PAGES = 2000;     // 2000 页 × 500 = 100 万条，防服务端一直给 token
+const SHARD_CONCURRENCY = 16;
 
 // Basic 认证。restic 把用户名密码放在 URL 里，每个请求都带。
 function basicOk(header, creds) {
@@ -44,7 +45,6 @@ export function createRestApp({ wps, buckets, creds, readOnly = false, uploadCon
 
   // ── 目录内容缓存：${driveId}/${parentId} → {map, ts} | {p} ──────
   // 进程内所有读都走它；写操作直接改 map，所以自己的写入立即可见。
-  // shortcut: data/ 单目录平铺，未验证 WPS 单目录条目上限；仓库到 10 万 pack 量级再考虑按 sha 前缀分片
   const dirMaps = new Map();
   async function dirMap(driveId, parentId, refresh = false) {
     const k = `${driveId}/${parentId}`;
@@ -54,7 +54,9 @@ export function createRestApp({ wps, buckets, creds, readOnly = false, uploadCon
     const p = (async () => {
       const map = new Map();
       let token = "", pages = 0;
-      // WPS children 是顺序翻页：65k 对象 ≈ 130 次调用（一次列举后缓存，不是每个请求都列）
+      // WPS children 顺序翻页，500/页；data/ 靠分片目录把每页控制在小范围（见 listData）
+      // 注意：一页全是目录时（page_size=500）WPS 只回 256 条且不给 next_page_token；
+      // data/ 正好 256 个分片所以安全，分片数超过 256 会静默漏列。
       // shortcut: 顺序翻页不并发；实测列举成为瓶颈时再按页预取
       do {
         const d = await wps.children(driveId, parentId, token);
@@ -159,7 +161,36 @@ export function createRestApp({ wps, buckets, creds, readOnly = false, uploadCon
     }
   }
 
-  // ── 路由解析 ──────────────────────────────────────────────────
+  // rest-server 的布局：data 按 sha 前两位分片（data/ab/abcdef...），其余类型平铺。
+  // REST 的 URL 始终是平的（/data/<hex>），分片只是服务端实现细节。
+  // 这样同一个仓库既能用 S3 访问也能用 REST 访问。
+  const blobParts = (repo, type, id) => [...repo, ...(type === "data" ? [type, id.slice(0, 2)] : [type])];
+
+  async function mapLimit(items, limit, fn) {
+    const out = new Array(items.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < items.length) {
+        const i = next++;
+        out[i] = await fn(items[i]);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+    return out;
+  }
+
+  // 列举 data/：先拿 256 个分片目录，再并发拉每个分片里的 pack
+  async function listData(driveId, repo) {
+    const dataId = await resolveDir(driveId, [...repo, "data"], false);
+    if (!dataId) return null;
+    const shards = [...(await dirMap(driveId, dataId)).values()].filter((f) => f.type === "folder");
+    const lists = await mapLimit(shards, SHARD_CONCURRENCY, async (shard) => {
+      const m = await dirMap(driveId, shard.id);
+      return [...m.values()].filter((f) => f.type !== "folder").map((f) => ({ name: f.name, size: f.size ?? 0 }));
+    });
+    return lists.flat();
+  }
+
   // 末段是 config / 类型目录 / 类型目录下的 64 位 hex；其余是 repo 路径（首段是 bucket）
   function parse(req) {
     let segs;
@@ -233,12 +264,18 @@ export function createRestApp({ wps, buckets, creds, readOnly = false, uploadCon
         return res.status(405).end();
       }
 
-      const typeId = await resolveDir(bucket.driveId, [...r.repo, r.type], false);
       if (r.kind === "list") {
-        if (!typeId) return res.status(404).type("text/plain").send("no such type dir");
         if (req.method !== "GET") return res.status(405).end();
-        const map = await dirMap(bucket.driveId, typeId);
-        const items = [...map.values()]
+        if (r.type === "data") {
+          const items = await listData(bucket.driveId, r.repo);
+          if (!items) return res.status(404).type("text/plain").send("no such type dir");
+          const v2 = (req.headers.accept ?? "").includes("restic.rest.v2");
+          res.status(200).set("Content-Type", v2 ? V2 : V1);
+          return res.end(JSON.stringify(v2 ? items : items.map((i) => i.name)));
+        }
+        const typeId = await resolveDir(bucket.driveId, [...r.repo, r.type], false);
+        if (!typeId) return res.status(404).type("text/plain").send("no such type dir");
+        const items = [...(await dirMap(bucket.driveId, typeId)).values()]
           .filter((f) => f.type !== "folder")
           .map((f) => ({ name: f.name, size: f.size ?? 0 }));
         const v2 = (req.headers.accept ?? "").includes("restic.rest.v2");
@@ -248,9 +285,10 @@ export function createRestApp({ wps, buckets, creds, readOnly = false, uploadCon
         return res.end(JSON.stringify(v2 ? items : items.map((i) => i.name)));
       }
 
-      // kind === "blob"
-      const node = typeId
-        ? await childByName(bucket.driveId, typeId, r.id, { cached: req.method === "POST" })
+      // kind === "blob"：POST 时按需建分片目录
+      const dirId = await resolveDir(bucket.driveId, blobParts(r.repo, r.type, r.id), req.method === "POST");
+      const node = dirId
+        ? await childByName(bucket.driveId, dirId, r.id, { cached: req.method === "POST" })
         : null;
       if (req.method === "HEAD") {
         if (!node) return res.status(404).end();
@@ -261,10 +299,10 @@ export function createRestApp({ wps, buckets, creds, readOnly = false, uploadCon
         return await proxyGet(req, res, bucket.driveId, node);
       }
       if (req.method === "POST") {
-        if (!typeId) return res.status(404).end();
+        if (!dirId) return res.status(404).end();
         if (node) return res.status(403).type("text/plain").send("blob already exists");
         if (readOnly) return res.status(403).type("text/plain").send("read-only");
-        await saveBlob(bucket.driveId, typeId, r.id, req);
+        await saveBlob(bucket.driveId, dirId, r.id, req);
         return res.status(200).end();
       }
       if (req.method === "DELETE") {
@@ -272,7 +310,7 @@ export function createRestApp({ wps, buckets, creds, readOnly = false, uploadCon
         if (readOnly && r.type !== "locks") return res.status(403).type("text/plain").send("read-only");
         if (node) {
           await wps.deleteFile(bucket.driveId, node.id);
-          (await dirMap(bucket.driveId, typeId)).delete(r.id);
+          (await dirMap(bucket.driveId, dirId)).delete(r.id);
         }
         return res.status(200).end(); // 幂等
       }

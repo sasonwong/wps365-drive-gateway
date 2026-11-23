@@ -65,6 +65,8 @@ restic -r rest:http://gateway-admin:change-me@127.0.0.1:9000/rest/personal/backu
 - 认证：Basic，用户名/密码复用 `s3Credentials` 的 accessKey/secretKey
 - `bucket` 就是 S3 的 bucket 映射（个人盘 / 团队文档库都可）
 - 仓库是云盘里的一个普通目录（`config` / `data` / `index` / `keys` / `locks` / `snapshots`），可在 WPS 网页端看到
+- `data/` 按 sha 前两位分片（`data/ab/abcdef…`），与 rest-server 的磁盘布局一致；
+  所以同一个仓库既能用 S3 访问也能用 REST 访问（REST URL 始终是平的）
 - `readOnly: true` 时拒绝写入，只允许删 `locks`（`restic unlock` 可用；读操作加 `--no-lock`）
 - REST 协议不使用 mtime，restic 自己保存时间戳，所以无需 `--size-only` 之类的开关
 

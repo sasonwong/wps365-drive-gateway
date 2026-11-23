@@ -135,3 +135,23 @@ test("仓库目录名可以是中文（路径段解码）", async () => {
   assert.equal((await fetch(u("/备份/仓库/config"), { method: "POST", headers: h, body: Buffer.from("{}") })).status, 200);
   assert.equal((await fetch(u("/备份/仓库/config"), { method: "HEAD", headers: h })).status, 200);
 });
+
+test("data 分片：按 sha 前两位落到子目录，列举时合并", async () => {
+  const ids = [];
+  for (let i = 0; i < 3; i++) {
+    const body = Buffer.from(`pack-${i}`);
+    const id = sha(body);
+    await call("POST", `/data/${id}`, { body });
+    ids.push(id);
+  }
+  const r = await call("GET", "/data/", { headers: { Accept: "application/vnd.x.restic.rest.v2" } });
+  assert.equal(r.status, 200);
+  const names = new Set((await r.json()).map((i) => i.name));
+  for (const id of ids) assert.ok(names.has(id), `missing ${id}`);
+
+  // 物理上确实分片了：data/ 下是按 sha 前两位命名的目录
+  const repo = (await fake.allChildren("0")).find((i) => i.name === "repo");
+  const dataDir = (await fake.allChildren(repo.id)).find((i) => i.name === "data");
+  const shards = (await fake.allChildren(dataDir.id)).filter((i) => i.type === "folder").map((i) => i.name);
+  for (const s of new Set(ids.map((id) => id.slice(0, 2)))) assert.ok(shards.includes(s), `missing shard ${s}`);
+});
