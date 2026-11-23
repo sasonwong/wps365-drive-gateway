@@ -52,6 +52,7 @@ app.use("/rest", createRestApp({
   buckets: cfg.buckets,
   creds: cfg.s3Credentials,
   readOnly: cfg.readOnly ?? false,
+  appendOnlyPaths: cfg.appendOnlyPaths ?? [],
   uploadConcurrency,
 }));
 app.use(createS3App({
@@ -59,6 +60,7 @@ app.use(createS3App({
   buckets: cfg.buckets,
   creds: cfg.s3Credentials,
   readOnly: cfg.readOnly ?? false,
+  appendOnlyPaths: cfg.appendOnlyPaths ?? [],
   pruneEmptyDirs: cfg.pruneEmptyDirs ?? true,
   cacheTtlMs: cfg.cacheTtlMs ?? 30_000,
   listConcurrency: cfg.listConcurrency ?? 16,

@@ -155,3 +155,33 @@ test("data 分片：按 sha 前两位落到子目录，列举时合并", async (
   const shards = (await fake.allChildren(dataDir.id)).filter((i) => i.type === "folder").map((i) => i.name);
   for (const s of new Set(ids.map((id) => id.slice(0, 2)))) assert.ok(shards.includes(s), `missing shard ${s}`);
 });
+
+test("append-only：仓库路径下删除被拒，locks 例外，仓库外照常", async () => {
+  const app = express();
+  app.use("/rest", createRestApp({
+    wps: fake.wps,
+    buckets: [{ name: "personal", driveId: "drive-1" }],
+    creds: [{ accessKey: "user", secretKey: "pass" }],
+    appendOnlyPaths: ["personal/repo"],
+    uploadConcurrency: 2,
+  }));
+  const srv = app.listen(0, "127.0.0.1");
+  await new Promise((r) => srv.once("listening", r));
+  const url = (p) => `http://127.0.0.1:${srv.address().port}/rest${p}`;
+  const del = (p) => fetch(url(p), { method: "DELETE", headers: { Authorization: auth } });
+  try {
+    const sha = "a".repeat(64);
+    assert.equal((await del(`/personal/repo/data/${sha}`)).status, 403);      // 冷仓数据
+    assert.equal((await del(`/personal/repo/index/${sha}`)).status, 403);
+    assert.equal((await del(`/personal/repo/snapshots/${sha}`)).status, 403);
+    assert.equal((await del("/personal/repo/config")).status, 403);
+    assert.equal((await del(`/personal/repo/locks/${sha}`)).status, 200);     // unlock 要用
+    // 仓库外：先建一个仓库，再删它下面的对象
+    const created = await fetch(url("/personal/other?create=true"), { method: "POST", headers: { Authorization: auth } });
+    assert.equal(created.status, 200);
+    assert.equal((await del(`/personal/other/data/${sha}`)).status, 200);
+  } finally {
+    srv.closeAllConnections();
+    await new Promise((r) => srv.close(r));
+  }
+});

@@ -3,6 +3,7 @@ import express from "express";
 import crypto from "node:crypto";
 import { parseAuth, verifySigV4, sigV4Error } from "./sigv4.js";
 import { throttleStream } from "./throttle.js";
+import { makeAppendOnly } from "./append-only.js";
 
 function xmlEscape(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -12,7 +13,8 @@ function errXml(code, msg) {
   return `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${xmlEscape(msg)}</Message></Error>`;
 }
 
-export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = true, cacheTtlMs = 30_000, listConcurrency = 16, uploadConcurrency = 2 }) {
+export function createS3App({ wps, buckets, creds, readOnly, appendOnlyPaths = [], pruneEmptyDirs = true, cacheTtlMs = 30_000, listConcurrency = 16, uploadConcurrency = 2 }) {
+  const isAppendOnly = makeAppendOnly(appendOnlyPaths);
   CACHE_TTL = cacheTtlMs;
   LIST_CONCURRENCY = Math.max(1, listConcurrency);
   INGRESS_CONCURRENCY = Math.max(1, uploadConcurrency);
@@ -231,6 +233,7 @@ export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = tr
       if (readOnly) return res.status(403).type("xml").send(errXml("AccessDenied", "gateway is read-only"));
       const b = bucket(req.params.bucket);
       if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
+      if (isAppendOnly(b.name, req.params[0])) return res.status(403).type("xml").send(errXml("AccessDenied", "append-only: delete is not allowed"));
       const parts = req.params[0].split("/").filter(Boolean);
       const name = parts.pop();
       if (req.query.uploads !== undefined) { // Create
@@ -285,6 +288,7 @@ export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = tr
       if (readOnly) return res.status(403).type("xml").send(errXml("AccessDenied", "gateway is read-only"));
       const b = bucket(req.params.bucket);
       if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
+      if (isAppendOnly(b.name, req.params[0])) return res.status(403).type("xml").send(errXml("AccessDenied", "append-only: delete is not allowed"));
       if (req.query.delete === undefined) return next();
       // 解析 XML body：<Delete><Object><Key>..</Key></Object>...<Quiet>..</Quiet></Delete>
       const xml = req.rawBody.toString();
@@ -348,6 +352,7 @@ export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = tr
       if (readOnly) return res.status(403).type("xml").send(errXml("AccessDenied", "gateway is read-only"));
       const b = bucket(req.params.bucket);
       if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
+      if (isAppendOnly(b.name, req.params[0])) return res.status(403).type("xml").send(errXml("AccessDenied", "append-only: delete is not allowed"));
       const parts = req.params[0].split("/").filter(Boolean);
 
       // UploadPart: 缓冲到 uploadId 对应会话（Complete 时统一上传）
@@ -421,6 +426,7 @@ export function createS3App({ wps, buckets, creds, readOnly, pruneEmptyDirs = tr
       if (readOnly) return res.status(403).type("xml").send(errXml("AccessDenied", "gateway is read-only"));
       const b = bucket(req.params.bucket);
       if (!b) return res.status(404).type("xml").send(errXml("NoSuchBucket", "bucket not found"));
+      if (isAppendOnly(b.name, req.params[0])) return res.status(403).type("xml").send(errXml("AccessDenied", "append-only: delete is not allowed"));
       if (req.query.uploadId) { // Abort
         const up = mpu.get(req.query.uploadId);
         if (!up) return res.status(404).type("xml").send(errXml("NoSuchUpload", "The specified upload does not exist."));

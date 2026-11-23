@@ -9,6 +9,7 @@ import express from "express";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { throttleStream } from "./throttle.js";
+import { makeAppendOnly } from "./append-only.js";
 
 const TYPES = new Set(["data", "index", "keys", "locks", "snapshots"]);
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -31,7 +32,8 @@ function timingEq(a, b) {
   return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
-export function createRestApp({ wps, buckets, creds, readOnly = false, uploadConcurrency = 2 }) {
+export function createRestApp({ wps, buckets, creds, readOnly = false, appendOnlyPaths = [], uploadConcurrency = 2 }) {
+  const isAppendOnly = makeAppendOnly(appendOnlyPaths);
   const app = express();
   app.disable("x-powered-by");
 
@@ -255,6 +257,7 @@ export function createRestApp({ wps, buckets, creds, readOnly = false, uploadCon
         }
         if (req.method === "DELETE") {
           if (readOnly) return res.status(403).type("text/plain").send("read-only");
+          if (isAppendOnly(bucket.name, r.repo.join("/"))) return res.status(403).type("text/plain").send("append-only");
           if (node) {
             await wps.deleteFile(bucket.driveId, node.id);
             (await dirMap(bucket.driveId, repoId)).delete("config");
@@ -308,6 +311,7 @@ export function createRestApp({ wps, buckets, creds, readOnly = false, uploadCon
       if (req.method === "DELETE") {
         // append-only：只允许删锁，其余拒（restic unlock 需要）
         if (readOnly && r.type !== "locks") return res.status(403).type("text/plain").send("read-only");
+        if (isAppendOnly(bucket.name, r.repo.join("/")) && r.type !== "locks") return res.status(403).type("text/plain").send("append-only");
         if (node) {
           await wps.deleteFile(bucket.driveId, node.id);
           (await dirMap(bucket.driveId, dirId)).delete(r.id);

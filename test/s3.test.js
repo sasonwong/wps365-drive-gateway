@@ -264,3 +264,44 @@ test("目录宽度大于 50 时续页不漏条目（曾因 token 截断栈丢掉
     assert.equal(new Set(got).size, 120, "出现重复条目");
   } finally { await new Promise((r) => srv.close(r)); }
 });
+
+test("append-only：冷仓路径下的 DELETE 被拒，其他路径照常", async () => {
+  const files = { "cold/repo/data/ab/x": { id: "f1", type: "file" }, "tmp/x": { id: "f2", type: "file" } };
+  const deleted = [];
+  const wps = {
+    accessToken: "t",
+    children: async () => ({ items: [], next_page_token: "" }),
+    meta: async (_d, id) => files[Object.keys(files).find((k) => files[k].id === id)] ?? null,
+    deleteFile: async (_d, id) => { deleted.push(id); },
+    resolve: null,
+  };
+  // resolvePath 按名字逐级查：用一个最小的树给 DELETE 用（目录 root/tmp 与 root/cold/repo/data/ab）
+  const tree = {
+    "0": [{ id: "d-tmp", name: "tmp", type: "folder" }, { id: "d-rustic", name: "rustic", type: "folder" }],
+    "d-rustic": [{ id: "d-life", name: "life", type: "folder" }],
+    "d-life": [{ id: "d-data", name: "data", type: "folder" }],
+    "d-data": [{ id: "d-ab", name: "ab", type: "folder" }],
+    "d-ab": [{ id: "f1", name: "x", type: "file", size: 1, mtime: 1700000000 }],
+    "d-tmp": [{ id: "f2", name: "x", type: "file", size: 1, mtime: 1700000000 }],
+  };
+  wps.children = async (_d, parent) => ({ items: tree[parent] ?? [], next_page_token: "" });
+  wps.meta = async (_d, id) => Object.values(tree).flat().find((f) => f.id === id) ?? null;
+  const app = createS3App({ wps, buckets: [{ name: "personal", driveId: "d-ao" }], creds: [{ accessKey: "test", secretKey: "test-secret" }], appendOnlyPaths: ["personal/cold/repo"], pruneEmptyDirs: false });
+  const srv = app.listen(0);
+  const req = (path) => new Promise((resolve) => {
+    const host = `127.0.0.1:${srv.address().port}`;
+    const signed = aws4.sign({ method: "DELETE", path, host, headers: { host }, body: "", service: "s3", region: "us-east-1" }, { accessKeyId: "test", secretAccessKey: "test-secret" });
+    http.request({ host: "127.0.0.1", port: srv.address().port, method: "DELETE", path, headers: signed.headers }, (res) => {
+      let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve({ status: res.statusCode, body: b }));
+    }).on("error", () => resolve({ status: 0, body: "" })).end();
+  });
+  try {
+    const blocked = await req("/personal/cold/repo/data/ab/x");
+    assert.equal(blocked.status, 403);
+    assert.match(blocked.body, /append-only/);
+    assert.deepEqual(deleted, []);
+    const ok = await req("/personal/tmp/x");
+    assert.equal(ok.status, 204);
+    assert.deepEqual(deleted, ["f2"]);
+  } finally { await new Promise((r) => srv.close(r)); }
+});
