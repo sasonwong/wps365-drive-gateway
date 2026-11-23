@@ -1,6 +1,7 @@
 # rclone sync 实测记录
 
 > 开发过程笔记：问题、根因与验证结果。读者对象是后续维护者。
+> restic / rustic 的 REST 端点实测见 [restic-notes.md](restic-notes.md)。
 
 ## 结论
 

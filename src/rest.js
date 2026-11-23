@@ -56,7 +56,7 @@ export function createRestApp({ wps, buckets, creds, readOnly = false, uploadCon
       let token = "", pages = 0;
       // WPS children 顺序翻页，500/页；data/ 靠分片目录把每页控制在小范围（见 listData）
       // 注意：一页全是目录时（page_size=500）WPS 只回 256 条且不给 next_page_token；
-      // data/ 正好 256 个分片所以安全，分片数超过 256 会静默漏列。
+      // data/ 正好 256 个分片所以当前安全；分片数超过 256 需要重新验证这个假设。
       // shortcut: 顺序翻页不并发；实测列举成为瓶颈时再按页预取
       do {
         const d = await wps.children(driveId, parentId, token);

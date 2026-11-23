@@ -1,6 +1,11 @@
 # WPS365 Drive Gateway
 
-把 WPS 365 云文档（个人盘 + 团队文档库）暴露为标准 **S3 协议** endpoint。任何 S3 客户端（aws cli、boto3、rclone、s3cmd、MinIO Client…）都可以像用 S3 一样读写你的 WPS 云盘。
+把 WPS 365 云文档（个人盘 + 团队文档库）暴露成两种标准接口：
+
+- **S3**：任何 S3 客户端（aws cli、boto3、rclone、s3cmd、MinIO Client…）像用 S3 一样读写
+- **restic REST**：restic / rustic 直接备份，不需要 `rclone serve` 再套一层
+
+两条通道读写的是同一份目录树（同一个仓库既可用 S3 也可用 REST 访问）。
 
 ## 特性
 
@@ -67,8 +72,16 @@ restic -r rest:http://gateway-admin:change-me@127.0.0.1:9000/rest/personal/backu
 - 仓库是云盘里的一个普通目录（`config` / `data` / `index` / `keys` / `locks` / `snapshots`），可在 WPS 网页端看到
 - `data/` 按 sha 前两位分片（`data/ab/abcdef…`），与 rest-server 的磁盘布局一致；
   所以同一个仓库既能用 S3 访问也能用 REST 访问（REST URL 始终是平的）
-- `readOnly: true` 时拒绝写入，只允许删 `locks`（`restic unlock` 可用；读操作加 `--no-lock`）
+- `readOnly: true` 时拒绝写入，只允许删 `locks`（`restic unlock` 可用；读命令本身不写，`check` 会建锁，需加 `--no-lock`）
 - REST 协议不使用 mtime，restic 自己保存时间戳，所以无需 `--size-only` 之类的开关
+
+兼容性与限制：
+
+- restic ≥ 0.7.1 即可（老版本走 v1 列举）；rustic 只认 v2，已用它跑通全流程
+- 已在真实备份仓上验证过 `snapshots` / `ls` / `dump` / 全量 `check`，
+  细节见 [docs/restic-notes.md](docs/restic-notes.md)
+- 每次读对象都要先向 WPS 取一次直链，全量 `check` 的调用次数等于 pack 数量；限流窗口内跑
+- Basic 是明文认证，只适合本机/内网，公网请套 TLS
 
 协议要点（改动时别踩）：
 
@@ -119,7 +132,7 @@ systemctl --user enable --now wps365-drive-gateway
 | `listConcurrency` | 递归列举时并发拉取子目录的数量，默认 16。调大可加速大仓库列举（如 rustic/restic 的 pack 列表），过高会撞 WPS 限流 |
 | `cacheTtlMs` | 目录列表缓存时长，默认 30000（30s）。网关自身的写操作会立即失效缓存，只有外部（网页端/客户端）改动要等 TTL 生效 |
 | `uploadRate` / `downloadRate` | 网关到 WPS 的限速，数字（字节/秒）或字符串（`"2MiB"`、`"500KiB/s"`），0 或不写=不限。上传按 64 KiB 分片节流，削的是突发峰值不只是平均速率 |
-| `uploadConcurrency` | 同时在内存里的写请求体数量，默认 2。闸门卡在读 body 之前，因为整个对象会驻留内存：大对象并发时内存峰值显著偏高，限到 1 后下降 |
+| `uploadConcurrency` | 同时处理的写请求数，默认 2。S3 的请求体会驻留内存（闸门卡在读 body 之前），REST 的 pack 先落临时文件；两边都用这个值限制并发 |
 
 ## 安全说明
 
@@ -138,8 +151,9 @@ WPS 的"文件夹"是真实实体，S3 协议没有目录对象，两者差异�
 
 ## 设计文档
 
-[docs/DESIGN.md](docs/DESIGN.md) — 架构、映射、鉴权、API 依赖清单、功能取舍。
+[docs/DESIGN.md](docs/DESIGN.md) — 架构、映射、鉴权、API 依赖清单、功能取舍、REST backend 设计（§9）。
 [docs/sync-notes.md](docs/sync-notes.md) — rclone sync 联调记录（覆盖语义/mtime/多部分上传坑）。
+[docs/restic-notes.md](docs/restic-notes.md) — restic REST 端点的协议契约、真实仓验证与限制。
 
 ## License
 

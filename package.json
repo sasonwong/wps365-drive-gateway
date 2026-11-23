@@ -1,7 +1,7 @@
 {
   "name": "wps365-drive-gateway",
   "version": "0.1.0",
-  "description": "S3-compatible gateway for WPS 365 cloud drive (个人盘 + 团队文档库)",
+  "description": "S3 + restic REST gateway for WPS 365 cloud drive (个人盘 + 团队文档库)",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
