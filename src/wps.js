@@ -146,6 +146,21 @@ export class WpsClient {
     };
   }
 
+  // 网络层重试：WPS 侧偶发 ECONNRESET / 连接被重置时，fetch 直接 reject。
+  // 这类失败在客户端看来是 500，rustic 会退避重试，但一次抖动就可能让整轮备份的
+  // 索引写入掉队（整轮索引都要重传）。网关内部补 2 次、间隔 200/500ms。
+  // make() 每次调用都要新建请求（body 流不能复用）。
+  async fetchRetry(make, enabled = true, attempts = 3) {
+    for (let i = 0; ; i++) {
+      try {
+        return await make();
+      } catch (e) {
+        if (!enabled || i + 1 >= attempts) throw e;
+        await new Promise((r) => setTimeout(r, 200 * 2 ** i));
+      }
+    }
+  }
+
   // ── REST 调用 ─────────────────────────────────────────────────
   async request(method, uri, body, opts = {}) {
     await this.ensureToken();
@@ -156,8 +171,11 @@ export class WpsClient {
       ...(rawBody ? { "Content-Type": "application/json" } : {}),
     };
     // 限流（429000001，WPS 对 token 校验接口的频率限制，窗口秒级）短退避重试：1s/2s/4s
+    // 默认只对 GET 做网络重试：POST 可能是 create/copy，重试会造出重复对象
+    const retryNet = opts.retryNet ?? method === "GET";
+    const { retryNet: _ignored, ...fetchOpts } = opts;
     for (let attempt = 0; ; attempt++) {
-      const r = await fetch(this.cfg.apiBase + uri, { method, headers, body: rawBody, ...opts });
+      const r = await this.fetchRetry(() => fetch(this.cfg.apiBase + uri, { method, headers, body: rawBody, ...fetchOpts }), retryNet);
       const data = await r.json().catch(() => ({}));
       if (!r.ok || data.code !== 0) {
         // token 过期/失效时用 refresh_token 重试一次
@@ -218,7 +236,7 @@ export class WpsClient {
       size,
       hashes: [{ type: "sha256", sum: sha256 }],
       on_name_conflict: "overwrite", // S3 PUT 覆盖语义（rename 会产生 (N) 孤儿，rclone 死循环）
-    });
+    }, { retryNet: true }); // 重试只会多建一个会过期的上传任务，幂等
   }
 
   // 直传实体文件到云存储：KSO-1 签名 + 与申请接口相同的登录凭据（Bearer）
@@ -229,10 +247,12 @@ export class WpsClient {
     const headers = this.kso1Headers(storeRequest.method ?? "PUT", url.pathname + url.search, body, contentType);
     headers["Content-Length"] = body.length;
     headers["Authorization"] = `Bearer ${this.accessToken}`;
-    const out = throttleBody(body, this.uploadBucket);
-    const up = await fetch(url, {
-      method: storeRequest.method ?? "PUT", headers, body: out,
-      ...(out === body ? {} : { duplex: "half" }), // 流式 body 需要显式 half-duplex
+    const up = await this.fetchRetry(() => {
+      const out = throttleBody(body, this.uploadBucket); // 每次重试都要新建流
+      return fetch(url, {
+        method: storeRequest.method ?? "PUT", headers, body: out,
+        ...(out === body ? {} : { duplex: "half" }), // 流式 body 需要显式 half-duplex
+      });
     });
     if (!up.ok) throw new Error(`store upload failed: ${up.status} ${(await up.text()).slice(0, 120)}`);
   }
@@ -247,16 +267,15 @@ export class WpsClient {
     const headers = this.kso1Headers(storeRequest.method ?? "PUT", url.pathname + url.search, null, contentType, sha256);
     headers["Content-Length"] = String(size);
     headers["Authorization"] = `Bearer ${this.accessToken}`;
-    const src = fs.createReadStream(filePath);
-    const body = this.uploadBucket ? src.pipe(throttleStream(this.uploadBucket)) : src;
-    let up;
-    try {
-      up = await fetch(url, { method: storeRequest.method ?? "PUT", headers, body, duplex: "half" });
-      if (!up.ok) throw new Error(`store upload failed: ${up.status} ${(await up.text()).slice(0, 120)}`);
-      await up.arrayBuffer(); // 排空响应
-    } finally {
-      src.destroy();
-    }
+    // 每次尝试重新打开文件流：流被消费过一次就不能复用
+    const up = await this.fetchRetry(() => {
+      const src = fs.createReadStream(filePath);
+      const body = this.uploadBucket ? src.pipe(throttleStream(this.uploadBucket)) : src;
+      return fetch(url, { method: storeRequest.method ?? "PUT", headers, body, duplex: "half" })
+        .finally(() => src.destroy());
+    });
+    if (!up.ok) throw new Error(`store upload failed: ${up.status} ${(await up.text()).slice(0, 120)}`);
+    await up.arrayBuffer(); // 排空响应
   }
 
   // ── 分块上传（WPS 固定块大小，服务端下发 part_size）────────────

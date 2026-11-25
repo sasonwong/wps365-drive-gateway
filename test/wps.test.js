@@ -103,3 +103,50 @@ test("refresh() 采信 tokens.json 里已被别的进程轮换的 refresh_token"
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("网络抖动重试：GET 自动重试，POST 默认不重试，重试次数用尽才抛错", async () => {
+  const wps = new WpsClient({ apiBase: "http://127.0.0.1:1", kso1Sign: false }, path.join(os.tmpdir(), "no-such-tokens.json"));
+  let n = 0;
+  const r = await wps.fetchRetry(async () => {
+    if (++n < 3) throw new TypeError("fetch failed");
+    return "ok";
+  });
+  assert.equal(r, "ok");
+  assert.equal(n, 3);
+
+  let m = 0;
+  await assert.rejects(() => wps.fetchRetry(async () => { m++; throw new TypeError("fetch failed"); }));
+  assert.equal(m, 3);                                   // 2 次重试后再抛
+
+  let k = 0;
+  await assert.rejects(() => wps.fetchRetry(async () => { k++; throw new TypeError("fetch failed"); }, false));
+  assert.equal(k, 1);                                   // disabled 时只试一次
+});
+
+test("request() 的 GET 会重试网络错误，POST 不会", async () => {
+  const orig = globalThis.fetch;
+  const wps = () => {
+    const w = new WpsClient({ apiBase: "http://fake", kso1Sign: false }, path.join(os.tmpdir(), "no-such-tokens.json"));
+    w.accessToken = "t";
+    w.expiresAt = Date.now() + 60000;
+    return w;
+  };
+  try {
+    // GET：第一次 fetch 抛错，重试后成功
+    let calls = 0;
+    globalThis.fetch = async () => {
+      if (++calls === 1) throw new TypeError("fetch failed");
+      return { ok: true, status: 200, json: async () => ({ code: 0, data: "ok" }) };
+    };
+    assert.equal(await wps().request("GET", "/x"), "ok");
+    assert.equal(calls, 2);
+
+    // POST：不重试，只发一次
+    calls = 0;
+    globalThis.fetch = async () => { calls++; throw new TypeError("fetch failed"); };
+    await assert.rejects(() => wps().request("POST", "/y", {}));
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
