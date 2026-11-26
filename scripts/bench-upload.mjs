@@ -19,7 +19,7 @@ const [mbArg, timesArg, prefixArg] = process.argv.slice(2);
 const mb = Number(mbArg ?? 10);
 const times = Number(timesArg ?? 5);
 const prefix = (prefixArg ?? "personal/_bench").replace(/^\/|\/$/g, "");
-const host = `${cfg.host ?? "127.0.0.1"}:${cfg.port ?? 9000}`;
+const host = `${[cfg.host ?? "127.0.0.1"].flat()[0]}:${cfg.port ?? 9000}`;
 const { accessKey, secretKey } = cfg.s3Credentials[0];
 
 const body = crypto.randomBytes(mb * 1048576);
@@ -29,7 +29,7 @@ for (let i = 0; i < times; i++) {
   const t0 = Date.now();
   try {
     const req = aws4.sign(
-      { host, path: `/${key}`, method: "PUT", body, headers: { host, "content-type": "application/octet-stream" } },
+      { host, path: `/${key}`, method: "PUT", body, service: "s3", region: "us-east-1", headers: { host, "content-type": "application/octet-stream" } },
       { accessKeyId: accessKey, secretAccessKey: secretKey },
     );
     const r = await fetch(`http://${host}/${key}`, { method: "PUT", headers: req.headers, body });
@@ -40,7 +40,7 @@ for (let i = 0; i < times; i++) {
     console.log(`  #${i + 1} ${mb} MiB  ${(ms / 1000).toFixed(1)}s  ${(mb / (ms / 1000)).toFixed(2)} MiB/s`);
     // 清理（在 append-only 路径外，可删）
     const del = aws4.sign(
-      { host, path: `/${key}`, method: "DELETE", headers: { host } },
+      { host, path: `/${key}`, method: "DELETE", service: "s3", region: "us-east-1", headers: { host } },
       { accessKeyId: accessKey, secretAccessKey: secretKey },
     );
     await fetch(`http://${host}/${key}`, { method: "DELETE", headers: del.headers }).catch(() => {});
