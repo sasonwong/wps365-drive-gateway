@@ -297,6 +297,8 @@ export class WpsClient {
   // 从磁盘文件直传（restic pack 可达 128MB，不能整块进内存）；哈希已在落盘时算好
   async uploadStoreHashed(storeRequest, filePath, size, sha256) {
     const url = new URL(storeRequest.url);
+    // 排障用：WPS 的直传地址分区域，海外的上传会偶发卡到 408/500
+    if (process.env.WPS_DEBUG_UPLOAD) console.log(`[upload] ${size}B → ${url.host}`);
     const contentType = "application/octet-stream";
     const headers = this.kso1Headers(storeRequest.method ?? "PUT", url.pathname + url.search, null, contentType, sha256);
     headers["Content-Length"] = String(size);
