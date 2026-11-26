@@ -138,7 +138,7 @@ systemctl --user enable --now wps365-drive-gateway
 | `readOnly` | true 时拒绝写操作 |
 | `listConcurrency` | 递归列举时并发拉取子目录的数量，默认 16。调大可加速大仓库列举（如 rustic/restic 的 pack 列表），过高会撞 WPS 限流 |
 | `cacheTtlMs` | 目录列表缓存时长，默认 30000（30s）。网关自身的写操作会立即失效缓存，只有外部（网页端/客户端）改动要等 TTL 生效 |
-| `uploadRate` / `downloadRate` | 网关到 WPS 的限速（只有上行带宽有限的节点才需要设（家宽），VPS 节点不设即可），数字（字节/秒）或字符串（`"2MiB"`、`"500KiB/s"`），0 或不写=不限。上传按 64 KiB 分片节流，削的是突发峰值不只是平均速率 |
+| `uploadRate` / `downloadRate` | 网关到 WPS 的限速，数字（字节/秒）或字符串（`"2MiB"`、`"500KiB/s"`），0 或不写=不限。只有家宽这种上行有限的节点才需要设，VPS 不设即可。上传按 64 KiB 分片节流，削的是突发峰值不只是平均速率 |
 | `uploadConcurrency` | 同时处理的写请求数，默认 2。S3 的请求体会驻留内存（闸门卡在读 body 之前），REST 的 pack 先落临时文件；两边都用这个值限制并发 |
 
 ## 安全说明
