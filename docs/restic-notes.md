@@ -96,3 +96,13 @@ rustic -r ... restore latest /tmp/dst
 离线回归：`npm test` 里的 `test/rest-e2e.test.js` 会起一个 fake WPS + 网关，
 用真实 rustic 二进制跑 init/backup/check --read-data/forget --prune/restore；
 没装 rustic 时自动 skip。协议契约单测在 `test/rest.test.js`。
+
+## WPS OAuth 会话：单会话
+
+实测（2026-11-26）：同一 (clientId, 用户) 上第二次设备码授权后，旧会话的
+`refresh_token` 刷新返回 401，即服务端只保留最新一个会话。
+
+- 影响：任何"第二处登录"都会把线上网关踢掉，网关随后卡在设备码登录等人工授权。
+- 因此多机方案只有两条路：每台机器一个独立应用，或共用一台网关（其余机器经内网访问）。
+- 设备码轮询的 pending 响应现在是 `{"code":40000999,"msg":"authorization_pending"}`，
+  旧代码只认 `50000006`，会把等待当成错误直接退出（已修）。

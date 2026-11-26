@@ -75,9 +75,11 @@ export class WpsClient {
         this.setTokens(td.data?.access_token ? { ...td.data, refresh_token: td.data.refresh_token ?? this.refreshToken } : td);
         console.log("✓ 登录成功"); return;
       }
+      // WPS 的 pending 有新旧两种形状：{code:50000006} 与 {code:40000999,msg:"authorization_pending"}
       const errCode = td.code ?? td.error;
-      if (errCode === 50000006 || td.error === "authorization_pending") continue;
-      if (td.error === "slow_down") { await new Promise((res) => setTimeout(res, 5000)); continue; }
+      const reason = td.error ?? td.msg;
+      if (errCode === 50000006 || errCode === 40000999 || reason === "authorization_pending") continue;
+      if (reason === "slow_down") { await new Promise((res) => setTimeout(res, 5000)); continue; }
       console.log("[login] 原始响应:", JSON.stringify(td));
       throw new Error(`token: ${td.error ?? td.msg}: ${td.error_description ?? ""}`);
     }
