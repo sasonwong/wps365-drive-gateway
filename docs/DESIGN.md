@@ -125,7 +125,8 @@ restic 把用户名密码放在仓库 URL 里（`rest:http://user:pass@host/...`
 
 ```jsonc
 {
-  "host": "127.0.0.1",
+  // 字符串或数组；数组可同时监听回环与内网/tailnet，供异地的 rustic 直连
+  "host": ["127.0.0.1", "<内网或 tailnet 地址>"],
   "port": 9000,
   "s3Credentials": [
     { "accessKey": "gateway-admin", "secretKey": "change-me" }

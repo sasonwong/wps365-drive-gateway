@@ -74,11 +74,14 @@ app.use(createS3App({
   uploadConcurrency,
 }));
 
-app.listen(cfg.port ?? 9000, cfg.host ?? "127.0.0.1", () => {
-  console.log(`\nWPS365 Drive Gateway 已启动: http://${cfg.host ?? "127.0.0.1"}:${cfg.port ?? 9000}`);
-  console.log(`S3 凭证: ${cfg.s3Credentials.map((c) => c.accessKey).join(", ")}`);
-  console.log(`Buckets: ${buckets.map((b) => b.name).join(", ")}${cfg.readOnly ? " (只读)" : ""}`);
-  console.log(`restic REST: rest:http://<user>:<pass>@${cfg.host ?? "127.0.0.1"}:${cfg.port ?? 9000}/rest/<bucket>/<repo 路径>/`);
-  const fmt = (n) => (n ? `${(n / 1048576).toFixed(1)} MiB/s` : "不限");
-  console.log(`限速: 上传 ${fmt(rates.upload)}，下载 ${fmt(rates.download)}，写并发 ${uploadConcurrency}\n`);
-});
+// host 可以是字符串或数组：数组用于同时监听回环与 tailnet，供异地的 rustic 直连
+const port = cfg.port ?? 9000;
+const hosts = [cfg.host ?? "127.0.0.1"].flat();
+for (const host of hosts) {
+  app.listen(port, host, () => console.log(`WPS365 Drive Gateway 监听 http://${host}:${port}`));
+}
+console.log(`S3 凭证: ${cfg.s3Credentials.map((c) => c.accessKey).join(", ")}`);
+console.log(`Buckets: ${buckets.map((b) => b.name).join(", ")}${cfg.readOnly ? " (只读)" : ""}`);
+console.log(`restic REST: rest:http://<user>:<pass>@<网关地址>:${port}/rest/<bucket>/<repo 路径>/`);
+const fmt = (n) => (n ? `${(n / 1048576).toFixed(1)} MiB/s` : "不限");
+console.log(`限速: 上传 ${fmt(rates.upload)}，下载 ${fmt(rates.download)}，写并发 ${uploadConcurrency}\n`);
