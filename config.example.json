@@ -30,7 +30,7 @@
   "pruneEmptyDirs": true,
   "listConcurrency": 16,
   "cacheTtlMs": 30000,
-  "uploadRate": "2MiB",
+  "uploadRate": 0,
   "downloadRate": 0,
   "uploadConcurrency": 2,
   "appendOnlyPaths": [],
