@@ -142,3 +142,22 @@ test("WpsClient 客户端模式：ensureToken 向 broker 取，401 后 refresh �
     assert.equal(fake.refreshes, 2);
   } finally { await s.close(); }
 });
+
+test("刷新遇到 401 → 自动发起重授权并回调通知（网络抖动则不发）", async () => {
+  const fake = makeFake({ expired: true });
+  const seen = [];
+  let failWith = "refresh failed: 401";
+  fake.refresh = async () => { throw new Error(failWith); };
+  const s = await serve(fake, { onLoginRequired: (u) => seen.push(u) });
+  try {
+    assert.equal((await fetch(`${s.url}/token`, { headers: AUTH })).status, 503);
+    assert.equal(seen.length, 1, "401 应触发一次设备码链接");
+    assert.match(seen[0], /user_code=/);
+
+    // 网络类错误不再发起授权
+    seen.length = 0;
+    failWith = "fetch failed";
+    assert.equal((await fetch(`${s.url}/refresh`, { method: "POST", headers: AUTH })).status, 503);
+    assert.equal(seen.length, 0, "网络错误不应刷设备码");
+  } finally { await s.close(); }
+});

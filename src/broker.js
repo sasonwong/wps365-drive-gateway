@@ -22,6 +22,20 @@ export function createBrokerApp({ wps, tokens = [], scopes, onLoginRequired }) {
   const state = { lastRefresh: 0, lastError: null, login: null };
   let inflight = null;
 
+  // 发起设备码登录（幂等：登录进行中就直接复用），成功后 token 自动生效
+  const beginLogin = async () => {
+    if (state.login) return state.login;
+    const d = await wps.startLogin(scopes);
+    const url = `${d.verification_uri}?user_code=${d.user_code}`;
+    state.login = { url, startedAt: Date.now() };
+    onLoginRequired?.(url);
+    wps.pollLogin(d)
+      .then(() => { state.lastRefresh = Date.now(); state.lastError = null; })
+      .catch((e) => { state.lastError = `login: ${e.message}`; })
+      .finally(() => { state.login = null; });
+    return state.login;
+  };
+
   // 互斥：并发的 /token 只触发一次刷新（refresh_token 是单次使用，抢跑会互相作废）
   const refreshOnce = () => {
     if (!inflight) {
@@ -32,6 +46,8 @@ export function createBrokerApp({ wps, tokens = [], scopes, onLoginRequired }) {
           state.lastError = null;
         } catch (e) {
           state.lastError = e.message;
+          // 凭据失效（不是网络抖动）才自动发起重授权，避免抖动时刷屏设备码
+          if (/401|invalid|expired/i.test(e.message)) beginLogin().catch(() => {});
           throw e;
         } finally {
           inflight = null;
@@ -58,17 +74,8 @@ export function createBrokerApp({ wps, tokens = [], scopes, onLoginRequired }) {
   // 设备码登录：第一次调用发起，后续调用返回同一个链接；后台轮询，成功即自动生效
   app.get("/login", auth, async (req, res) => {
     try {
-      if (!state.login) {
-        const d = await wps.startLogin(scopes);
-        const url = `${d.verification_uri}?user_code=${d.user_code}`;
-        state.login = { url, startedAt: Date.now() };
-        onLoginRequired?.(url);
-        wps.pollLogin(d)
-          .then(() => { state.lastRefresh = Date.now(); state.lastError = null; })
-          .catch((e) => { state.lastError = `login: ${e.message}`; })
-          .finally(() => { state.login = null; });
-      }
-      res.json({ url: state.login.url, expires_in: 600 });
+      const login = await beginLogin();
+      res.json({ url: login.url, expires_in: 600 });
     } catch (e) { fail(res, e); }
   });
 
