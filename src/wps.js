@@ -205,7 +205,11 @@ export class WpsClient {
     const retryNet = opts.retryNet ?? method === "GET";
     const { retryNet: _ignored, ...fetchOpts } = opts;
     for (let attempt = 0; ; attempt++) {
-      const r = await this.fetchRetry(() => fetch(this.cfg.apiBase + uri, { method, headers, body: rawBody, ...fetchOpts }), retryNet);
+      // 没有超时的 fetch 会被半开连接拖死：sg2 实测卡住 5 分钟没有任何 I/O。
+      // API 调用 60s 封顶，超时按网络错误交给上层重试。
+      const r = await this.fetchRetry(() => fetch(this.cfg.apiBase + uri, {
+        method, headers, body: rawBody, signal: AbortSignal.timeout(60_000), ...fetchOpts,
+      }), retryNet);
       const data = await r.json().catch(() => ({}));
       if (!r.ok || data.code !== 0) {
         // token 过期/失效时用 refresh_token 重试一次
@@ -301,8 +305,10 @@ export class WpsClient {
     const up = await this.fetchRetry(() => {
       const src = fs.createReadStream(filePath);
       const body = this.uploadBucket ? src.pipe(throttleStream(this.uploadBucket)) : src;
-      return fetch(url, { method: storeRequest.method ?? "PUT", headers, body, duplex: "half" })
-        .finally(() => src.destroy());
+      return fetch(url, {
+        method: storeRequest.method ?? "PUT", headers, body, duplex: "half",
+        signal: AbortSignal.timeout(600_000), // 直传大包：10 分钟封顶
+      }).finally(() => src.destroy());
     });
     if (!up.ok) throw new Error(`store upload failed: ${up.status} ${(await up.text()).slice(0, 120)}`);
     await up.arrayBuffer(); // 排空响应
@@ -329,6 +335,7 @@ export class WpsClient {
     const out = throttleBody(data, this.uploadBucket);
     const up = await fetch(url.origin + uri, {
       method: "PUT", headers, body: out,
+      signal: AbortSignal.timeout(600_000),
       ...(out === data ? {} : { duplex: "half" }),
     });
     if (!up.ok) throw new Error(`multipart part ${partNumber}: ${up.status} ${(await up.text()).slice(0, 120)}`);
