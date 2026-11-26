@@ -105,8 +105,8 @@ test("/login：首次返回链接并回调通知，授权完成后 token 可用"
     // 第二次调用复用同一个链接，不重复发起授权
     assert.equal((await (await fetch(`${s.url}/login`, { headers: AUTH })).json()).url, d.url);
     assert.equal(fake.logins, 1);
-    // 等后台轮询完成
-    await new Promise((r) => setTimeout(r, 60));
+    // 等后台轮询完成（轮询是异步的，固定 sleep 在并发测试下会偶发不稳）
+    for (let i = 0; i < 100 && fake.accessToken !== "at-login"; i++) await new Promise((r) => setTimeout(r, 5));
     const t = await (await fetch(`${s.url}/token`, { headers: AUTH })).json();
     assert.equal(t.access_token, "at-login");
   } finally { await s.close(); }
@@ -159,5 +159,17 @@ test("刷新遇到 401 → 自动发起重授权并回调通知（网络抖动�
     failWith = "fetch failed";
     assert.equal((await fetch(`${s.url}/refresh`, { method: "POST", headers: AUTH })).status, 503);
     assert.equal(seen.length, 0, "网络错误不应刷设备码");
+  } finally { await s.close(); }
+});
+
+test("WPS 401 路径直接调 wps.refresh() 时，status 的 last_refresh 也会更新", async () => {
+  const fake = makeFake();
+  const s = await serve(fake);
+  try {
+    const before = await (await fetch(`${s.url}/status`, { headers: AUTH })).json();
+    assert.equal(before.last_refresh, null);
+    await fake.refresh(); // 模拟客户端 401 后直接刷新，不经过 /refresh 路由
+    const after = await (await fetch(`${s.url}/status`, { headers: AUTH })).json();
+    assert.ok(after.last_refresh > 0, "last_refresh 应被补上");
   } finally { await s.close(); }
 });

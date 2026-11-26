@@ -22,6 +22,16 @@ export function createBrokerApp({ wps, tokens = [], scopes, onLoginRequired }) {
   const state = { lastRefresh: 0, lastError: null, login: null };
   let inflight = null;
 
+  // WPS 客户端在 401 时会直接调 wps.refresh()（不经过本模块），这里包一层把统计补上，
+  // 否则 last_refresh 只反映 broker 路由触发的刷新，监控会误判。
+  const rawRefresh = wps.refresh.bind(wps);
+  wps.refresh = async () => {
+    const r = await rawRefresh();
+    state.lastRefresh = Date.now();
+    state.lastError = null;
+    return r;
+  };
+
   // 发起设备码登录（幂等：登录进行中就直接复用），成功后 token 自动生效
   const beginLogin = async () => {
     if (state.login) return state.login;
