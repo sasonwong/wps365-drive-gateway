@@ -210,3 +210,25 @@ pack 可达 128MB，不能整块进内存：
 - Basic 明文认证，只适合本机/内网
 - prune 删除对象后分片目录会留下空目录（无害，不自动回收）
 - 不验 `mtime`：时间戳全在 restic 自己的 snapshot/index JSON 里
+
+## 10. Token broker（多机共用一份 OAuth 会话）
+
+WPS 的 OAuth 是**单会话**：同一 (应用, 用户) 第二次设备码授权会让旧 `refresh_token`
+立即 401。所以多机不能各自登录，但可以让一台机器独占刷新链、其它机器只借 access token。
+
+```
+xs2  gateway（broker 模式）  ← 独占 tokens.json
+  GET  /oauth/token    按需刷新后返回 {access_token, expires_at}   Bearer 鉴权
+  POST /oauth/refresh  强制刷新（客户端收到 WPS 401 后调）
+  GET  /oauth/login    发起设备码授权，返回链接；后台轮询，成功即生效
+  GET  /oauth/status   {ok, expires_at, last_refresh, last_error, login_pending}
+        │  tailnet（只有 token，没有数据）
+   sg / hk2 / sg2  各自跑网关（tokenBroker 模式）→ 数据直连 WPS
+```
+
+- 客户端 `tokenBroker = { url, token }`：不落任何 token 文件，`ensureToken` 向 broker 取，
+  401 时调 `/oauth/refresh` 后重试一次。
+- 刷新在 broker 内**互斥**：并发请求只触发一次，避免 refresh_token 单次使用被抢跑作废。
+- 每台机器一个随机 Bearer（`brokerTokens`），日志里能看出是谁在刷。
+- 需要人工重授权时，broker 用 `notify.sh` 把设备码链接推 Telegram，点一下即可。
+- 取舍：broker 挂了所有 WPS 备份停（数据安全不受影响），换取数据面不再经过单台机器。

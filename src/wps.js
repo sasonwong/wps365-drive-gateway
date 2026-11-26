@@ -6,9 +6,11 @@ import { Bucket, throttleBody, throttleStream } from "./throttle.js";
 
 export class WpsClient {
   // rates: { upload, download, uploadConcurrency }（字节/秒，0=不限速）
-  constructor(cfg, tokenFile, rates = {}) {
+  // broker: { url, token } —— 有值时进入客户端模式：不碰 refresh_token，只向 broker 要 access token
+  constructor(cfg, tokenFile, rates = {}, broker = null) {
     this.cfg = cfg;
     this.tokenFile = tokenFile;
+    this.broker = broker;
     this.accessToken = null;
     this.refreshToken = null;
     this.expiresAt = 0;
@@ -20,6 +22,7 @@ export class WpsClient {
   }
 
   load() {
+    if (this.broker) return; // 客户端模式没有本地 token 文件
     if (!fs.existsSync(this.tokenFile)) return;
     try {
       const t = JSON.parse(fs.readFileSync(this.tokenFile, "utf8"));
@@ -30,6 +33,7 @@ export class WpsClient {
   }
 
   save() {
+    if (this.broker) return; // 客户端模式不落 token 文件（本机不持有刷新链）
     fs.mkdirSync(path.dirname(this.tokenFile), { recursive: true });
     // 原子写：先写临时文件再 rename。直接覆盖时进程被杀会留下半截 JSON，
     // load() 会静默忽略、退回设备码登录（常驻服务因此卡在等授权）。
@@ -43,8 +47,8 @@ export class WpsClient {
   }
 
   // ── OAuth2 设备码流程（RFC 8628）──────────────────────────────
-  async login(scopes) {
-    // 1. 请求 device_code
+  // 拆成两半：broker 需要"先拿链接、后台再轮询"，CLI 需要"拿链接 + 阻塞等待"
+  async startLogin(scopes) {
     const base = new URL(this.cfg.tokenUrl).origin;
     const form = new URLSearchParams({ client_id: this.cfg.clientId, scope: scopes });
     const r = await fetch(`${base}/oauth2/device/authorize`, {
@@ -54,8 +58,18 @@ export class WpsClient {
     });
     const d = await r.json();
     if (d.error) throw new Error(`device authorize: ${d.error}: ${d.error_description ?? ""}`);
+    return d;
+  }
+
+  async login(scopes) {
+    const d = await this.startLogin(scopes);
     console.log(`\n请在浏览器打开并授权（10 分钟内有效）:\n  ${d.verification_uri}?user_code=${d.user_code}\n`);
-    // 2. 轮询换取 token
+    await this.pollLogin(d);
+    console.log("✓ 登录成功");
+  }
+
+  async pollLogin(d) {
+    const base = new URL(this.cfg.tokenUrl).origin;
     const poll = new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:device_code",
       client_id: this.cfg.clientId,
@@ -73,7 +87,7 @@ export class WpsClient {
       // WPS 的轮询响应是 {code, msg} 包装：pending=50000006，成功时 data.access_token
       if (td.access_token || td.data?.access_token) {
         this.setTokens(td.data?.access_token ? { ...td.data, refresh_token: td.data.refresh_token ?? this.refreshToken } : td);
-        console.log("✓ 登录成功"); return;
+        return;
       }
       // WPS 的 pending 有新旧两种形状：{code:50000006} 与 {code:40000999,msg:"authorization_pending"}
       const errCode = td.code ?? td.error;
@@ -107,6 +121,7 @@ export class WpsClient {
   }
 
   async refresh() {
+    if (this.broker) return this.brokerCall("refresh");
     this.adoptFromFile();
     if (!this.refreshToken) throw new Error("无 refresh_token，需要重新设备码登录");
     const r = await fetch(this.cfg.tokenUrl, {
@@ -126,7 +141,20 @@ export class WpsClient {
 
   async ensureToken() {
     if (this.accessToken && Date.now() < this.expiresAt) return;
+    if (this.broker) return this.brokerCall("token");
     await this.refresh();
+  }
+
+  // 客户端模式：向 broker 换 access token。token=按需刷新，refresh=强制刷新（401 后用）
+  async brokerCall(kind) {
+    const r = await fetch(`${this.broker.url}/${kind}`, {
+      method: kind === "refresh" ? "POST" : "GET",
+      headers: { Authorization: `Bearer ${this.broker.token}` },
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.access_token) throw new Error(`broker ${kind}: ${r.status} ${d.error ?? ""}`);
+    this.accessToken = d.access_token;
+    this.expiresAt = d.expires_at ?? Date.now() + 7_000_000;
   }
 
   // ── KSO-1 签名 ────────────────────────────────────────────────

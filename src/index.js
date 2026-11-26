@@ -8,6 +8,8 @@ import { parseRate } from "./throttle.js";
 import { createS3App } from "./s3.js";
 import { createRestApp } from "./rest.js";
 import { mergeBuckets, missingBuckets } from "./buckets.js";
+import { createBrokerApp } from "./broker.js";
+import { spawn } from "node:child_process";
 
 // 网关是常驻代理：网络抖动的单次失败不该让整个服务退出（挂了就所有备份/客户端一起停）。
 // 兜底记录后继续跑；真正的 bug 会在日志里留下堆栈。
@@ -25,10 +27,18 @@ const rates = {
   download: parseRate(cfg.downloadRate),
 };
 const uploadConcurrency = cfg.uploadConcurrency ?? 2;
-const wps = new WpsClient(cfg.wps, tokenFile, rates);
+// 两种角色：
+//   brokerTokens 有值 → 本进程是 broker，独占 refresh_token，对外发 access token
+//   tokenBroker 有值  → 本进程是客户端，只向 broker 要 access token，不持有刷新链
+const brokerClient = cfg.tokenBroker ? { url: cfg.tokenBroker.url, token: cfg.tokenBroker.token } : null;
+const wps = new WpsClient(cfg.wps, tokenFile, rates, brokerClient);
 
-// 首次运行：设备码登录
-if (!wps.accessToken) {
+if (brokerClient) {
+  try { await wps.ensureToken(); } catch (e) {
+    console.error(`[broker] 取不到 access token（${cfg.tokenBroker.url}）：${e.message}`);
+    process.exit(1);
+  }
+} else if (!wps.accessToken) {
   await wps.login(cfg.wps.scopes);
 } else {
   try { await wps.ensureToken(); } catch (e) { console.warn("token 刷新失败，尝试重新登录:", e.message); await wps.login(cfg.wps.scopes); }
@@ -53,6 +63,23 @@ try {
 } catch { /* 非致命 */ }
 
 const app = express();
+
+// token broker：需要人工重授权时把设备码链接推到 Telegram（notify.sh 不存在就只打日志）
+const notifyLogin = (url) => {
+  console.error(`[broker] 需要设备码授权：${url}`);
+  const child = spawn("/etc/rustic/notify.sh", ["🔑 WPS 网关需要重新授权"], { stdio: ["pipe", "ignore", "ignore"] });
+  child.on("error", () => {});
+  child.stdin.end(`打开并授权（10 分钟内有效）：\n${url}`);
+};
+if (cfg.brokerTokens?.length) {
+  app.use("/oauth", createBrokerApp({
+    wps,
+    tokens: cfg.brokerTokens,
+    scopes: cfg.wps.scopes,
+    onLoginRequired: notifyLogin,
+  }));
+}
+
 // REST 挂在 S3 之前：S3 的中间件会把整个请求体读进内存，restic 的 pack 不能走那条路
 app.use("/rest", createRestApp({
   wps,
@@ -84,4 +111,8 @@ console.log(`S3 凭证: ${cfg.s3Credentials.map((c) => c.accessKey).join(", ")}`
 console.log(`Buckets: ${buckets.map((b) => b.name).join(", ")}${cfg.readOnly ? " (只读)" : ""}`);
 console.log(`restic REST: rest:http://<user>:<pass>@<网关地址>:${port}/rest/<bucket>/<repo 路径>/`);
 const fmt = (n) => (n ? `${(n / 1048576).toFixed(1)} MiB/s` : "不限");
-console.log(`限速: 上传 ${fmt(rates.upload)}，下载 ${fmt(rates.download)}，写并发 ${uploadConcurrency}\n`);
+console.log(`限速: 上传 ${fmt(rates.upload)}，下载 ${fmt(rates.download)}，写并发 ${uploadConcurrency}`);
+const role = cfg.brokerTokens?.length
+  ? `token broker（${cfg.brokerTokens.map((t) => t.name).join(", ")} 持有 Bearer）`
+  : brokerClient ? `broker 客户端 → ${brokerClient.url}` : "自持 token";
+console.log(`角色: ${role}\n`);
